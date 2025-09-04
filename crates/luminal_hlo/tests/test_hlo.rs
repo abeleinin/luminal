@@ -29,6 +29,7 @@ fn test_stablehlo_unary_ops() {
 
 #[test]
 fn test_stablehlo_constant_op() {
+    println!("test_stablehlo_constant_op");
     let (mut cx, inputs) = import_hlo("tests/data/stablehlo_constant_op.mlir");
 
     inputs["%arg0"].set([1., 1., 1., 1.]);

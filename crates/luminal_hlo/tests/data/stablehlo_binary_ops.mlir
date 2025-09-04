@@ -1,5 +1,5 @@
 module {
-  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
+  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x4xf32> {
     %0 = stablehlo.add %arg0, %arg1 : tensor<2x2xf32>
     %1 = stablehlo.subtract %0, %arg1 : tensor<2x2xf32>
     %2 = stablehlo.multiply %0, %1 : tensor<2x2xf32>
