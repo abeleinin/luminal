@@ -15,6 +15,12 @@ pub enum Attr {
     Float(f64),
     Id(String),
     IntVec(Vec<usize>),
+    DimNumbers {
+        input: Vec<String>,
+        kernel: Vec<String>,
+        output: Vec<String>,
+    },
+    PadPairs(Vec<(usize, usize)>),
 }
 
 pub type AttrMap = HashMap<String, Attr>;

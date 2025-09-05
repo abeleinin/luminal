@@ -52,3 +52,29 @@ fn test_stablehlo_broadcast_in_dim_op() {
     let expected = [160.];
     assert_close(&inputs["%3"].data(), &expected);
 }
+
+#[test]
+fn test_stablehlo_convolution_1x1_nchw() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_convolution_1x1_nchw.mlir");
+
+    inputs["%arg0"].set([1.0, 2.0, 3.0, 4.0]);
+    inputs["%arg1"].set([2.0]);
+
+    cx.execute();
+
+    let expected = [2.0, 4.0, 6.0, 8.0];
+    assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_convolution_3x3_nchw() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_convolution_3x3_nchw.mlir");
+
+    inputs["%arg0"].set([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    inputs["%arg1"].set([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+
+    cx.execute();
+
+    let expected = [25.0];
+    assert_close(&inputs["%0"].data(), &expected);
+}

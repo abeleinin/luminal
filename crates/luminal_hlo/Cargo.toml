@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 luminal = { path = "../.." }
+luminal_nn = { path = "../luminal_nn" }
 regex = "1.9.5"
 anyhow = "1"
 

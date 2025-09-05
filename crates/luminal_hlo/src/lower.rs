@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use std::collections::HashMap;
 
 use luminal::prelude::*;
+use luminal_nn::Conv2D;
 
 type LowerFn = fn(&Operation, &mut Graph, &mut HashMap<String, GraphTensor>) -> Result<()>;
 
@@ -43,6 +44,8 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.constant" => lower_constant,
         // Reduce
         "stablehlo.reduce" => lower_reduce,
+        // Convolution
+        "stablehlo.convolution" => lower_convolution,
         // Pseudo
         "return" => lower_return,
         _ => return None,
@@ -270,6 +273,113 @@ fn lower_reduce(
         }
         other => bail!("unsupported reduce.apply: {:?}", other),
     }
+}
+
+// Convolution
+fn lower_convolution(
+    op: &Operation,
+    g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let x = env[&op.operands[0]];
+    let w = env[&op.operands[1]];
+
+    // dim_numbers
+    let (input_t, kernel_t, output_t) = match op.attributes.get("dim_numbers") {
+        Some(Attr::DimNumbers {
+            input,
+            kernel,
+            output,
+        }) => (input.clone(), kernel.clone(), output.clone()),
+        _ => bail!("convolution: missing dim_numbers"),
+    };
+
+    // Only canonical NCHW x OIHW -> NCHW for now.
+    let is_nchw = input_t == vec!["b", "f", "0", "1"]
+        && kernel_t == vec!["o", "i", "0", "1"]
+        && output_t == vec!["b", "f", "0", "1"];
+    if !is_nchw {
+        bail!("[lower_convolution] Only NCHW dim_numbers supported");
+    }
+
+    // window: pad / stride / dilations
+    let pads: Vec<(usize, usize)> = match op.attributes.get("window_pad") {
+        Some(Attr::PadPairs(p)) => p.clone(),
+        _ => vec![(0, 0), (0, 0)],
+    };
+    let stride = match op.attributes.get("stride") {
+        Some(Attr::IntVec(v)) if v.len() >= 2 => (v[0], v[1]),
+        _ => (1, 1),
+    };
+    let base_dilations = match op.attributes.get("base_dilations") {
+        Some(Attr::IntVec(v)) if v.len() >= 2 => (v[0], v[1]),
+        _ => (1, 1),
+    };
+    let window_dilations = match op.attributes.get("window_dilations") {
+        Some(Attr::IntVec(v)) if v.len() >= 2 => (v[0], v[1]),
+        _ => (1, 1),
+    };
+
+    // groups
+    let bg = match op.attributes.get("batch_group_count") {
+        Some(Attr::Int(i)) => *i as usize,
+        _ => 1,
+    };
+    let fg = match op.attributes.get("feature_group_count") {
+        Some(Attr::Int(i)) => *i as usize,
+        _ => 1,
+    };
+    if bg != 1 {
+        bail!("[lower_convolution] batch_group_count != 1 NYI");
+    }
+    if fg != 1 {
+        bail!("[lower_convolution] feature_group_count != 1 NYI");
+    }
+
+    // padding and dilation
+    if pads != vec![(0, 0), (0, 0)] {
+        bail!("[lower_convolution] Non-zero padding NYI");
+    }
+    if base_dilations != (1, 1) {
+        bail!("[lower_convolution] base dilation NYI");
+    }
+
+    let x_dims = x
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.to_usize().unwrap())
+        .collect::<Vec<_>>();
+    let w_dims = w
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.to_usize().unwrap())
+        .collect::<Vec<_>>();
+
+    let ch_in = x_dims[1];
+    let ch_out = w_dims[0];
+    let k_h = w_dims[2];
+    let k_w = w_dims[3];
+
+    let conv = Conv2D::new(
+        ch_in,
+        ch_out,
+        (k_h, k_w),
+        stride,
+        window_dilations,
+        false,
+        g,
+    );
+
+    // TODO: Hack to invalidate the weight tensor in the
+    // graph before aliasing it to the Conv2D weight.
+    w.set([0.0]);
+    env.insert(op.operands[1].clone(), conv.weight.clone());
+
+    let y = conv.forward(x);
+    env.insert(op.result_name.clone(), y);
+    Ok(())
 }
 
 // return
