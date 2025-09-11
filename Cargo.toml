@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 itertools = "0.11.0"
 num-traits = "0.2.16"
 petgraph = "0.6.4"
-rand = "0.8.5"
+rand = "0.9.2"
 urlencoding = "2.1.2"
 webbrowser = "1.0.0"
 dyn-clone = "1.0.12"
@@ -19,7 +19,7 @@ tinyvec = { version = "1.6.0", features = ["serde"] }
 term_size = "0.3.2"
 colored = "2.0.4"
 regex = "1.9.5"
-rustc-hash = "1.1.0"
+rustc-hash = "2.1.1"
 uuid = { version = "1.7.0", features = ["v4"] }
 as-any = "0.3.1"
 egg = "0.9.5"
@@ -27,16 +27,24 @@ symbolic_expressions = "5.0.3"
 serde = { version = "1.0.202", features = ["derive"] }
 thread_local = "1.1.8"
 generational-box = "0.5.6"
+serde_json = "1.0.140"
 
 [dev-dependencies]
 dfdx = { version = "0.13", features = ["f16"] }
 
 [workspace]
 members = [
-	"examples/*",
-	"crates/luminal_cpu",
-	"crates/luminal_nn",
+    "examples/*",
+    "crates/luminal_cpu",
+    "crates/luminal_nn",
+    "crates/luminal_training",
 	"crates/luminal_hlo",
-	"crates/luminal_training", "docs/company",
+    "docs/company",
 ]
-exclude = ["examples/yolo_v8", "crates/luminal_cuda", "crates/luminal_metal", "crates/luminal_2", "flash_attention_demo"]
+exclude = [
+    "examples/yolo_v8",
+    "crates/luminal_cuda",
+    "crates/luminal_metal",
+    "crates/luminal_2",
+    "demos/flash_attention",
+]

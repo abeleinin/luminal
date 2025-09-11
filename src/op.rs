@@ -179,6 +179,21 @@ impl Operator for Constant {
     }
 }
 
+/// Graph break for chunking search graphs
+#[derive(Clone, PartialEq)]
+pub struct GraphBreak;
+impl Debug for GraphBreak {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GraphBreak")
+    }
+}
+
+impl Operator for GraphBreak {
+    fn process(&mut self, inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        inp.into_iter().map(|(t, _)| t.cloned()).collect() // inefficient, but we don't care as this won't execute on the kernel
+    }
+}
+
 // Unary Op (A -> A)
 
 /// Ensure a tensor is contiguously layed out in memory. May involve copying

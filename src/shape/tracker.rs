@@ -162,8 +162,10 @@ impl ShapeTracker {
                 let ret = *state;
                 if !self.fake[i] {
                     *state *= self.dims[i];
+                    Some(ret)
+                } else {
+                    Some(Expression::from(0))
                 }
-                Some(ret)
             })
             .collect::<Vec<_>>();
         strides.reverse();
@@ -353,7 +355,7 @@ impl ShapeTracker {
             {
                 panic!("Adding padding to a masked shape isn't supported")
             }
-            let (s, e) = (s.max(0), e.max(0));
+            // let (s, e) = (s.max(0), e.max(0)); // why is this needed???
             self.padding[ind].0 += s;
             self.padding[ind].1 += e;
         }
@@ -421,7 +423,6 @@ mod tests {
         println!("Strides: {:?}", tracker.strides());
         println!("Ind: {:?}", tracker.index_expression());
         println!("Val: {:?}", tracker.valid_expression());
-        expression_cleanup();
     }
 
     #[test]

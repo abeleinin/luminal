@@ -1,47 +1,56 @@
 use egg::*;
-use generational_box::{AnyStorage, GenerationalBox, Owner, UnsyncStorage};
+use generational_box::{AnyStorage, GenerationalBox, Owner, SyncStorage};
 use rustc_hash::FxHashMap;
+use serde::{Serialize, Serializer};
 use std::{
-    cell::RefCell,
     fmt::Debug,
     hash::Hash,
     ops::{
         Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Div, DivAssign, Mul, MulAssign,
         Rem, RemAssign, Sub, SubAssign,
     },
+    sync::OnceLock,
 };
 use symbolic_expressions::Sexp;
 
-thread_local! {
-    static EXPRESSION_OWNER: RefCell<Option<Owner<UnsyncStorage>>> = RefCell::new(Some(UnsyncStorage::owner()));
+type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
+
+static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
+
+pub fn expression_owner() -> &'static Owner<SyncStorage> {
+    EXPR_OWNER.get_or_init(SyncStorage::owner)
 }
 
-/// Clean up symbolic expresion storage
-pub fn expression_cleanup() {
-    EXPRESSION_OWNER.with(|cell| cell.borrow_mut().take());
-}
-
-/// Get the thread-local owner of expression storage
-fn expression_owner() -> Owner {
-    EXPRESSION_OWNER.with(|cell| cell.borrow().clone().unwrap())
-}
-
-#[derive(Clone, Copy)]
+#[derive(Copy, Clone)]
 pub struct Expression {
-    pub terms: GenerationalBox<Vec<Term>>,
+    pub terms: ExprBox,
+}
+
+impl Serialize for Expression {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Access the Vec<Term> inside the GenerationalBox and serialize it
+        self.terms.read().serialize(serializer)
+    }
 }
 
 impl Expression {
-    fn new(terms: Vec<Term>) -> Self {
+    pub fn new(terms: Vec<Term>) -> Self {
         Self {
             terms: expression_owner().insert(terms),
         }
+    }
+
+    pub fn is_acc(&self) -> bool {
+        self.terms.read().iter().any(|i| matches!(i, Term::Acc(_)))
     }
 }
 
 impl Hash for Expression {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.simplify().terms.read().hash(state);
+        self.terms.read().hash(state);
     }
 }
 
@@ -52,7 +61,7 @@ impl Default for Expression {
 }
 
 /// A single term of a symbolic expression such as a variable, number or operation.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Term {
     Num(i32),
     Var(char),
@@ -67,6 +76,7 @@ pub enum Term {
     Or,
     Gte,
     Lt,
+    Acc(char),
 }
 
 impl std::fmt::Debug for Term {
@@ -85,6 +95,7 @@ impl std::fmt::Debug for Term {
             Term::Or => write!(f, "||"),
             Term::Gte => write!(f, ">="),
             Term::Lt => write!(f, "<"),
+            Term::Acc(s) => write!(f, "{s}"),
         }
     }
 }
@@ -128,6 +139,19 @@ impl Term {
             _ => None,
         }
     }
+    pub fn to_egglog(self) -> String {
+        match self {
+            Term::Add => "MAdd",
+            Term::Sub => "MSub",
+            Term::Mul => "MMul",
+            Term::Div => "MDiv",
+            Term::Mod => "MMod",
+            Term::Max => "MMax",
+            Term::Min => "MMin",
+            _ => panic!("egglog doesn't implement {self:?}"),
+        }
+        .to_string()
+    }
 }
 
 impl<T> PartialEq<T> for Expression
@@ -136,7 +160,6 @@ where
 {
     fn eq(&self, other: &T) -> bool {
         *self.terms.read() == *other.into().terms.read()
-        // self.equivalent(&other.into()) // For some reason this makes compilation (maybe understandable) and graphs (what?) very slow!
     }
 }
 
@@ -155,6 +178,7 @@ impl Debug for Expression {
             let new_symbol = match term {
                 Term::Num(n) => n.to_string(),
                 Term::Var(c) => c.to_string(),
+                Term::Acc(c) => format!("Acc({c})"),
                 Term::Max => format!(
                     "max({}, {})",
                     symbols.pop().unwrap(),
@@ -173,7 +197,76 @@ impl Debug for Expression {
             };
             symbols.push(new_symbol);
         }
-        write!(f, "{}", symbols.pop().unwrap())
+        write!(f, "{}", symbols.pop().unwrap_or_default())
+    }
+}
+
+impl Expression {
+    pub fn to_egglog(&self) -> String {
+        let mut symbols = vec![];
+        for term in self.terms.read().iter() {
+            let new_symbol = match term {
+                Term::Num(n) => format!("(MNum {n})"),
+                Term::Var(c) => format!("(MVar \"{c}\")"),
+                Term::Acc(s) => format!("(MAccum \"{s}\")"),
+                Term::Max => format!(
+                    "(MMax {} {})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                Term::Min => format!(
+                    "(MMin {} {})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                _ => format!(
+                    "({} {} {})",
+                    term.to_egglog(),
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+            };
+            symbols.push(new_symbol);
+        }
+        symbols.pop().unwrap_or_default()
+    }
+
+    pub fn to_kernel(&self) -> String {
+        let mut symbols = vec![];
+        for term in self.terms.read().iter() {
+            let new_symbol = match term {
+                Term::Num(n) => n.to_string(),
+                Term::Var(c) => format!("const_{c}"),
+                Term::Acc(_) => unreachable!(),
+                Term::Max => format!(
+                    "max((int){}, (int){})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                Term::Min => format!(
+                    "min((int){}, (int){})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                Term::Lt => format!(
+                    "(int)({} < {})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                Term::Gte => format!(
+                    "(int)({} >= {})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+                _ => format!(
+                    "({}{term:?}{})",
+                    symbols.pop().unwrap(),
+                    symbols.pop().unwrap()
+                ),
+            };
+            symbols.push(new_symbol);
+        }
+        symbols.pop().unwrap_or_default()
     }
 }
 
@@ -189,7 +282,7 @@ impl Expression {
         if self.terms.read().len() == 1 {
             return self;
         }
-        egg_simplify(self)
+        egg_simplify(self, false)
     }
 
     /// Simplify the expression to its minimal terms, using a cache to retrieve / store the simplification
@@ -239,7 +332,7 @@ impl Expression {
     /// Maximum
     pub fn max<E: Into<Expression>>(self, rhs: E) -> Self {
         let rhs = rhs.into();
-        if rhs == self || rhs == 0 || self == i32::MAX {
+        if rhs == self || self == i32::MAX {
             return self;
         }
         if self == 0 || rhs == i32::MAX {
@@ -312,7 +405,9 @@ impl Expression {
         }
         Expression::new(new_terms)
     }
+}
 
+impl Expression {
     /// Evaluate the expression with no variables. Returns Some(value) if no variables are required, otherwise returns None.
     pub fn to_usize(&self) -> Option<usize> {
         self.exec(&FxHashMap::default())
@@ -327,6 +422,7 @@ impl Expression {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n as i64),
+                Term::Acc(_) => stack.push(1),
                 Term::Var(_) => stack.push(value as i64),
                 _ => {
                     let a = stack.pop().unwrap();
@@ -350,6 +446,7 @@ impl Expression {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n as i64),
+                Term::Acc(_) => stack.push(1),
                 Term::Var(c) =>
                 {
                     #[allow(clippy::needless_borrow)]
@@ -381,6 +478,7 @@ impl Expression {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n as f64),
+                Term::Acc(_) => stack.push(1.0),
                 Term::Var(c) =>
                 {
                     #[allow(clippy::needless_borrow)]
@@ -417,31 +515,6 @@ impl Expression {
             .read()
             .iter()
             .any(|t| matches!(t, Term::Var('-')))
-    }
-
-    /// `true` if the two expressions are provably equivalent under `make_rules()`.
-    pub fn equivalent(&self, other: &Self) -> bool {
-        // short‑cuts that cost ~0
-        if std::ptr::eq(self, other) {
-            return true;
-        }
-        if *self.terms.read() == *other.terms.read() {
-            return true;
-        }
-
-        // 1. create an e‑graph and add both expressions
-        let mut egraph: EGraph = Default::default();
-        let id_a = egraph.add_expr(&luminal_to_egg(self));
-        let id_b = egraph.add_expr(&luminal_to_egg(other));
-
-        // 2. saturate with your rewrite rules (reuse the same limit you like)
-        let runner = Runner::default()
-            .with_egraph(egraph)
-            .with_iter_limit(5)
-            .run(&make_rules());
-
-        // 3. equivalent ⇔ their classes are identical
-        runner.egraph.find(id_a) == runner.egraph.find(id_b)
     }
 }
 
@@ -761,6 +834,18 @@ impl std::iter::Product for Expression {
     }
 }
 
+impl std::iter::Sum for Expression {
+    fn sum<I: Iterator<Item = Expression>>(mut iter: I) -> Self {
+        let Some(mut p) = iter.next() else {
+            return 0.into();
+        };
+        for n in iter {
+            p += n;
+        }
+        p
+    }
+}
+
 impl<E: Into<Expression>> AddAssign<E> for Expression {
     fn add_assign(&mut self, rhs: E) {
         *self = *self + rhs;
@@ -820,6 +905,7 @@ fn luminal_to_egg(expr: &Expression) -> RecExpr<Math> {
             Term::Num(_) | Term::Var(_) => {
                 stack.push(symbolic_expressions::Sexp::String(format!("{term:?}")))
             }
+            Term::Acc(_) => stack.push(symbolic_expressions::Sexp::String("1".to_string())),
             _ => {
                 let left = stack.pop().unwrap();
                 let right = stack.pop().unwrap();
@@ -1027,8 +1113,8 @@ fn is_const_positive(vars: &[&str]) -> impl Fn(&mut EGraph, Id, &Subst) -> bool 
     }
 }
 
-fn make_rules() -> Vec<Rewrite> {
-    vec![
+fn make_rules(lower_bound_zero: bool) -> Vec<Rewrite> {
+    let mut v = vec![
         // Communative properties
         rewrite!("commute-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
         rewrite!("commute-mul"; "(* ?a ?b)" => "(* ?b ?a)"),
@@ -1076,17 +1162,25 @@ fn make_rules() -> Vec<Rewrite> {
         rewrite!("mul-one";  "?a" => "(* ?a 1)"),
         rewrite!("cancel-sub"; "(- ?a ?a)" => "0"),
         rewrite!("cancel-div"; "(/ ?a ?a)" => "1" if is_not_zero("?a")),
-    ]
+        rewrite!("dedup-max"; "(max ?a (max ?a ?b))" => "(max ?a ?b)"),
+        rewrite!("dedup-min"; "(min ?a (min ?a ?b))" => "(min ?a ?b)"),
+    ];
+    if lower_bound_zero {
+        v.push(rewrite!("max-zero"; "(max ?a 0)" => "?a"));
+    }
+    v
 }
 
-fn egg_simplify(e: Expression) -> Expression {
+fn egg_simplify(e: Expression, lower_bound_zero: bool) -> Expression {
     // Convert to egg expression
     let expr = luminal_to_egg(&e);
     // Simplify
     let runner = Runner::default()
-        .with_iter_limit(5)
+        // .with_iter_limit(1_000)
+        // .with_time_limit(std::time::Duration::from_secs(30))
+        // .with_node_limit(100_000_000)
         .with_expr(&expr)
-        .run(&make_rules());
+        .run(&make_rules(lower_bound_zero));
     // runner.print_report();
     let extractor = Extractor::new(&runner.egraph, AstSize);
     let (_, best) = extractor.find_best(runner.roots[0]);
@@ -1096,8 +1190,7 @@ fn egg_simplify(e: Expression) -> Expression {
 
 #[cfg(test)]
 mod tests {
-
-    use crate::prelude::*;
+    use super::*;
     #[test]
     fn test_expressions() {
         let n = Expression::from('x') + (256 - (Expression::from('x') % 256));
@@ -1107,7 +1200,6 @@ mod tests {
                 .unwrap(),
             768
         );
-        expression_cleanup();
     }
 
     #[test]
@@ -1115,7 +1207,6 @@ mod tests {
         let expr = ((Expression::from('a') * 1) + 0) / 1 + (1 - 1);
         let reduced_expr = expr.simplify();
         assert_eq!(reduced_expr, 'a');
-        expression_cleanup();
     }
 
     #[test]
@@ -1124,7 +1215,6 @@ mod tests {
         let sub = Expression::from('x') / 2;
         let new = main.substitute('x', sub).simplify();
         assert_eq!(new.len(), 5);
-        expression_cleanup();
     }
 
     #[test]
@@ -1132,15 +1222,13 @@ mod tests {
         let s = Expression::from('s');
         let expr = (s * ((s - 4) + 1)) + (((s + 1) * ((s - 4) + 1)) - (s * ((s - 4) + 1)));
         assert_eq!(expr.simplify().len(), 7);
-        expression_cleanup();
     }
 
     #[test]
     fn test_simple_div() {
         let w = Expression::from('w');
         let s = ((((w + 3) / 2) + 2) / 2).simplify();
-        assert_eq!(s.simplify(), (w + 7) / 4);
-        expression_cleanup();
+        assert_eq!(s, (w + 7) / 4);
     }
 
     #[test]
@@ -1154,7 +1242,6 @@ mod tests {
             % 64;
         let x = o.simplify();
         assert_eq!(x.len(), 23); // Should be 21 if we can re-enable mul-div-associative-rev
-        expression_cleanup();
     }
 
     #[test]
@@ -1164,6 +1251,5 @@ mod tests {
         let h = Expression::from('h');
         let x = (z % (((((153 + h) / 8) + -31) * ((((w + 153) / 8) + -31) / 16)) * 64)).simplify();
         assert_eq!(x.len(), 15); // Should be 11 if we can re-enable mul-div-associative-rev
-        expression_cleanup();
     }
 }
