@@ -1,8 +1,8 @@
 use crate::ast::{Attr, Operation};
 use crate::parser::parse_output_shape_from_op;
 
-use anyhow::{bail, Result};
-use std::collections::HashMap;
+use anyhow::{bail, ensure, Result};
+use std::collections::{BTreeSet, HashMap};
 
 use luminal::prelude::*;
 use luminal_nn::Conv2D;
@@ -44,6 +44,7 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.constant" => lower_constant,
         // Reduce
         "stablehlo.reduce" => lower_reduce,
+        "stablehlo.reduce_window" => lower_reduce_window,
         // Convolution
         "stablehlo.convolution" => lower_convolution,
         // Pseudo
@@ -207,17 +208,86 @@ fn lower_reshape(
     Ok(())
 }
 
+fn broadcast_axis(x: &mut GraphTensor, axis: usize, new_len: impl Into<Expression>) {
+    let p = x.shape.indexes[axis];
+    x.shape.dims[p] = new_len.into();
+    x.shape.fake[p] = true;
+}
+
 fn lower_broadcast_in_dim(
     op: &Operation,
     _g: &mut Graph,
-    env: &mut HashMap<String, GraphTensor>,
+    env: &mut std::collections::HashMap<String, GraphTensor>,
 ) -> Result<()> {
     let x = env[&op.operands[0]];
-    let dims = match op.attributes.get("dims") {
-        Some(Attr::IntVec(v)) => v.clone(),
+
+    let dims: Vec<usize> = match op.attributes.get("dims") {
+        Some(Attr::IntVec(v)) => v.iter().map(|&u| u as usize).collect(),
         _ => bail!("broadcast_in_dim missing 'dims' attribute"),
     };
-    let y = x.expand(dims);
+
+    let out_shape: Vec<usize> = parse_output_shape_from_op(&op.result_type_src);
+    let r_out = out_shape.len();
+
+    let r_in: usize = x.shape.dims().len();
+
+    if r_in == 0 {
+        let ok_dims = dims.is_empty() || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
+        ensure!(
+            ok_dims,
+            "broadcast_in_dim: scalar operand expects dims == [] (or 0..r_out-1), got {:?}",
+            dims
+        );
+
+        let mut y = x;
+        for ax in 0..r_out {
+            y = y.expand_dim(ax, 1);
+            broadcast_axis(&mut y, ax, out_shape[ax]);
+        }
+        env.insert(op.result_name.clone(), y);
+        return Ok(());
+    }
+
+    ensure!(
+        dims.len() == x.shape.dims().len(),
+        "dims len {} != input rank {}",
+        dims.len(),
+        x.shape.dims().len()
+    );
+    ensure!(
+        dims.windows(2).all(|w| w[0] < w[1]),
+        "dims must be strictly increasing"
+    );
+    ensure!(
+        dims.iter().all(|&d| d < r_out),
+        "dims entries must be < out rank"
+    );
+
+    let dims_set: BTreeSet<_> = dims.iter().copied().collect();
+    let mut y = x;
+    for ax in 0..r_out {
+        if !dims_set.contains(&ax) {
+            y = y.expand_dim(ax, 1);
+        }
+    }
+
+    for out_ax in 0..r_out {
+        let want = out_shape[out_ax];
+        let cur = y.shape.dims()[out_ax];
+
+        if cur == want {
+            continue;
+        }
+
+        ensure!(
+            cur == 1,
+            "inserted axis {} has unexpected length {}",
+            out_ax,
+            cur
+        );
+        broadcast_axis(&mut y, out_ax, want);
+    }
+
     env.insert(op.result_name.clone(), y);
     Ok(())
 }
@@ -263,10 +333,12 @@ fn lower_reduce(
     let x = env[&op.operands[0]];
     match op.attributes.get("apply") {
         Some(Attr::Id(s)) if s == "stablehlo.add" => {
-            let dims = match (op.attributes.get("dimensions"), op.attributes.get("dims")) {
+            let mut dims = match (op.attributes.get("dimensions"), op.attributes.get("dims")) {
                 (Some(Attr::IntVec(v)), _) | (_, Some(Attr::IntVec(v))) => v.clone(),
                 _ => vec![],
             };
+            // TODO: Luminal sum does not support unsorted dimensions
+            dims.sort();
             let y = x.sum(dims);
             env.insert(op.result_name.clone(), y);
             Ok(())
@@ -294,7 +366,7 @@ fn lower_convolution(
         _ => bail!("convolution: missing dim_numbers"),
     };
 
-    // Only canonical NCHW x OIHW -> NCHW for now.
+    // Only supports canonical NCHW x OIHW -> NCHW
     let is_nchw = input_t == vec!["b", "f", "0", "1"]
         && kernel_t == vec!["o", "i", "0", "1"]
         && output_t == vec!["b", "f", "0", "1"];
@@ -337,9 +409,6 @@ fn lower_convolution(
     }
 
     // padding and dilation
-    if pads != vec![(0, 0), (0, 0)] {
-        bail!("[lower_convolution] Non-zero padding NYI");
-    }
     if base_dilations != (1, 1) {
         bail!("[lower_convolution] base dilation NYI");
     }
@@ -362,6 +431,14 @@ fn lower_convolution(
     let k_h = w_dims[2];
     let k_w = w_dims[3];
 
+    let (pt, pb) = pads.get(0).copied().unwrap_or((0, 0));
+    let (pl, pr) = pads.get(1).copied().unwrap_or((0, 0));
+    let x_padded = if pt | pb | pl | pr != 0 {
+        pad_nchw(g, &x, pt, pb, pl, pr)?
+    } else {
+        x.clone()
+    };
+
     let conv = Conv2D::new(
         ch_in,
         ch_out,
@@ -377,9 +454,189 @@ fn lower_convolution(
     w.set([0.0]);
     env.insert(op.operands[1].clone(), conv.weight.clone());
 
-    let y = conv.forward(x);
+    let y = conv.forward(x_padded);
     env.insert(op.result_name.clone(), y);
     Ok(())
+}
+
+fn pad_nchw(
+    g: &mut Graph,
+    x: &GraphTensor,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_left: usize,
+    pad_right: usize,
+) -> Result<GraphTensor> {
+    // x shape: [N, C, H, W]
+    let dims = x
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.to_usize().unwrap())
+        .collect::<Vec<_>>();
+    ensure!(dims.len() == 4, "pad_nchw expects NCHW rank-4 tensor");
+    let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
+
+    let h_padded = h + pad_top + pad_bottom;
+    let w_padded = w + pad_left + pad_right;
+
+    let mut zeros = |shape: (usize, usize, usize, usize)| -> GraphTensor {
+        let t = g.named_tensor("Zeros", (shape.0, shape.1, shape.2, shape.3));
+        t.set([0.0]);
+        t
+    };
+
+    let left = if pad_left > 0 {
+        zeros((n, c, h, pad_left))
+    } else {
+        x.clone()
+    };
+    let right = if pad_right > 0 {
+        zeros((n, c, h, pad_right))
+    } else {
+        x.clone()
+    };
+    let x_hpad = if pad_left > 0 || pad_right > 0 {
+        left.concat_along(x.clone(), 3).concat_along(right, 3)
+    } else {
+        x.clone()
+    };
+
+    let top = if pad_top > 0 {
+        zeros((n, c, pad_top, w_padded))
+    } else {
+        x_hpad.clone()
+    };
+    let bottom = if pad_bottom > 0 {
+        zeros((n, c, pad_bottom, w_padded))
+    } else {
+        x_hpad.clone()
+    };
+
+    let y = if pad_top > 0 || pad_bottom > 0 {
+        top.concat_along(x_hpad.clone(), 2).concat_along(bottom, 2)
+    } else {
+        x_hpad
+    };
+
+    ensure!(
+        y.shape
+            .dims()
+            .iter()
+            .map(|d| d.to_usize().unwrap())
+            .collect::<Vec<_>>()
+            == vec![n, c, h_padded, w_padded],
+        "pad_nchw produced unexpected shape"
+    );
+    Ok(y)
+}
+
+fn lower_reduce_window(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    if op.operands.len() < 1 {
+        bail!("reduce_window: expected at least 1 input");
+    }
+    let mut y = env[&op.operands[0]];
+
+    if op.operands.len() != 2 {
+        bail!("reduce_window: currently supports exactly one input + one init_value");
+    }
+
+    let apply = match op.attributes.get("apply") {
+        Some(Attr::Id(s)) => s.as_str(),
+        _ => bail!("reduce_window: missing/unknown reducer body; expected maximum"),
+    };
+    if apply != "stablehlo.maximum" {
+        bail!(
+            "reduce_window: only `stablehlo.maximum` is supported right now, got {}",
+            apply
+        );
+    }
+
+    let rank = y.shape.dims().len();
+    if rank != 4 {
+        bail!(
+            "reduce_window: only rank-4 NCHW tensors are supported (got rank={})",
+            rank
+        );
+    }
+
+    let win_dims = get_usize_vec(&op, "window_dimensions")?;
+    if win_dims.len() != 4 {
+        bail!("reduce_window: window_dimensions must be length 4 for NCHW");
+    }
+    let win_strides = get_usize_vec_default(&op, "window_strides", 4, 1)?;
+    let base_dils = get_usize_vec_default(&op, "base_dilations", 4, 1)?;
+    let win_dils = get_usize_vec_default(&op, "window_dilations", 4, 1)?;
+    let pads = get_pad_pairs_default(&op, 4)?;
+
+    if win_dims[0] != 1 || win_dims[1] != 1 {
+        bail!("reduce_window: only spatial pooling supported; expected window_dimensions[0..2) == [1,1]");
+    }
+    if base_dils.iter().any(|&v| v != 1) {
+        bail!("reduce_window: base_dilations not supported for pooling");
+    }
+
+    let kh = win_dims[2];
+    let kw = win_dims[3];
+    let sh = win_strides[2];
+    let sw = win_strides[3];
+    let dh = win_dils[2];
+    let dw = win_dils[3];
+    let (ph_lo, ph_hi) = pads[2];
+    let (pw_lo, pw_hi) = pads[3];
+
+    if ph_lo != 0 || ph_hi != 0 || pw_lo != 0 || pw_hi != 0 {
+        y = y.pad(&[(0, 0), (0, 0), (ph_lo, ph_hi), (pw_lo, pw_hi)]);
+    }
+
+    y = y.pool_last_dim(kw as usize, sw as usize, dw as usize);
+    let last_axis = y.shape.dims().len() - 1;
+    y = y.max(last_axis);
+
+    y = y.permute(&[0, 1, 3, 2]); // N, C, W, H
+    y = y.pool_last_dim(kh as usize, sh as usize, dh as usize);
+    let last_axis = y.shape.dims().len() - 1;
+    y = y.max(last_axis);
+    y = y.permute(&[0, 1, 3, 2]);
+
+    env.insert(op.result_name.clone(), y);
+    Ok(())
+}
+
+fn get_usize_vec(op: &Operation, key: &str) -> Result<Vec<usize>> {
+    match op.attributes.get(key) {
+        Some(Attr::IntVec(v)) => Ok(v.clone()),
+        other => bail!("reduce_window: missing `{}` (got {:?})", key, other),
+    }
+}
+
+fn get_usize_vec_default(op: &Operation, key: &str, n: usize, fill: usize) -> Result<Vec<usize>> {
+    let v = match op.attributes.get(key) {
+        Some(Attr::IntVec(v)) => v.clone(),
+        None => vec![fill; n],
+        other => bail!("reduce_window: bad `{}` (got {:?})", key, other),
+    };
+    if v.len() != n {
+        bail!("reduce_window: `{}` length must be {}", key, n);
+    }
+    Ok(v)
+}
+
+fn get_pad_pairs_default(op: &Operation, n: usize) -> Result<Vec<(usize, usize)>> {
+    Ok(match op.attributes.get("padding") {
+        Some(Attr::PadPairs(p)) => {
+            if p.len() != n {
+                bail!("reduce_window: padding must have {} pairs", n);
+            }
+            p.clone()
+        }
+        None => vec![(0, 0); n],
+        other => bail!("reduce_window: bad `padding` (got {:?})", other),
+    })
 }
 
 // return

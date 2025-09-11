@@ -29,7 +29,6 @@ fn test_stablehlo_unary_ops() {
 
 #[test]
 fn test_stablehlo_constant_op() {
-    println!("test_stablehlo_constant_op");
     let (mut cx, inputs) = import_hlo("tests/data/stablehlo_constant_op.mlir");
 
     inputs["%arg0"].set([1., 1., 1., 1.]);
@@ -76,5 +75,19 @@ fn test_stablehlo_convolution_3x3_nchw() {
     cx.execute();
 
     let expected = [25.0];
+    assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_reduce_window() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_reduce_window.mlir");
+
+    inputs["%arg0"].set([
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+    ]);
+
+    cx.execute();
+
+    let expected = [6.0, 8.0, 14.0, 16.0];
     assert_close(&inputs["%0"].data(), &expected);
 }

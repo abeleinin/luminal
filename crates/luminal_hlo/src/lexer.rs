@@ -40,6 +40,9 @@ impl<'a> Lexer<'a> {
                 self.skip_ws();
                 continue;
             }
+            if c == b'^' {
+                self.bump();
+            }
             match c as char {
                 '(' => {
                     self.bump();
@@ -104,6 +107,18 @@ impl<'a> Lexer<'a> {
                     let num = self.lex_number();
                     out.push(num);
                 }
+                '"' => {
+                    self.bump();
+                    let start = self.i;
+                    while let Some(b) = self.peek() {
+                        self.i += 1;
+                        if b == b'"' {
+                            break;
+                        }
+                    }
+                    let end = self.i - 1;
+                    out.push(Tok::Ident(self.s[start..end].to_string()));
+                }
                 _ => {
                     let ident = self.lex_ident();
                     out.push(Tok::Ident(ident));
@@ -148,7 +163,21 @@ impl<'a> Lexer<'a> {
     fn lex_number(&mut self) -> Tok {
         let start = self.i;
 
-        // integer part
+        if self.peek() == Some(b'0') {
+            self.bump();
+            if let Some(b'x') | Some(b'X') = self.peek() {
+                self.bump();
+                let hex_start = self.i;
+                self.eat_while(|c| c.is_ascii_hexdigit());
+                let text = &self.s[hex_start..self.i];
+                let value = i64::from_str_radix(text, 16).unwrap();
+                return Tok::Integer(value);
+            } else {
+                self.i = start;
+            }
+        }
+
+        // decimal/float path
         self.eat_while(|c| c.is_ascii_digit());
 
         let mut is_float = false;

@@ -31,20 +31,29 @@ impl<'a> Parser<'a> {
                     self.bump();
                     break;
                 }
-                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen) => {
-                    self.bump();
-                }
-                Some(Tok::Ident(s)) if s == "init" => {
-                    self.bump();
-                }
                 Some(Tok::Ident(s))
                     if s == "dim"
                         || s == "dims"
                         || s == "dim_numbers"
                         || s == "apply"
-                        || s == "dense" =>
+                        || s == "dense"
+                        || s == "window_dimensions"
+                        || s == "window_strides"
+                        || s == "base_dilations"
+                        || s == "window_dilations"
+                        || s == "padding"
+                        || s == "batch_group_count"
+                        || s == "feature_group_count" =>
                 {
                     break;
+                }
+                Some(Tok::Ident(s)) if s == "init" => {
+                    self.bump();
+                }
+                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen) | Some(Tok::LBracket)
+                | Some(Tok::RBracket) | Some(Tok::Less) | Some(Tok::Greater)
+                | Some(Tok::LBrace) | Some(Tok::RBrace) => {
+                    self.bump();
                 }
                 other => bail!("unexpected token in operand list: {:?}", other),
             }
@@ -92,6 +101,9 @@ impl<'a> Parser<'a> {
                     if let Some(Tok::Float(v)) = self.peek() {
                         attrs.insert("dense".into(), Attr::Float(v.clone()));
                     }
+                    if let Some(Tok::Integer(v)) = self.peek() {
+                        attrs.insert("dense".into(), Attr::Int(v.clone()));
+                    }
                 }
                 _ => {
                     self.bump();
@@ -101,6 +113,8 @@ impl<'a> Parser<'a> {
 
         if name == "stablehlo.convolution" {
             self.parse_convolution_attrs(&mut attrs)?;
+        } else if name == "stablehlo.reduce_window" {
+            self.parse_reduce_window_attrs(&mut attrs)?;
         }
 
         let mut result_type_src = String::new();
@@ -178,7 +192,11 @@ impl<'a> Parser<'a> {
                     if let Some(pi) = body.find("pad") {
                         if let Some(lb) = body[pi..].find('[') {
                             let pad_start = pi + lb;
-                            let pads = parse_pad_pairs(&body[pad_start..])?;
+                            let v: Vec<Vec<usize>> = serde_json::from_str(&body[pad_start..])?;
+                            let pads: Vec<(usize, usize)> = v
+                                .into_iter()
+                                .map(|pair| (pair[0], pair[1]))
+                                .collect::<Vec<(usize, usize)>>();
                             attrs.insert("window_pad".into(), Attr::PadPairs(pads));
                         }
                     }
@@ -214,6 +232,45 @@ impl<'a> Parser<'a> {
             if let Some((v, _)) = parse_trailing_int(&self.src[fi..]) {
                 attrs.insert("feature_group_count".into(), Attr::Int(v as i64));
             }
+        }
+
+        Ok(())
+    }
+
+    fn parse_reduce_window_attrs(&self, attrs: &mut AttrMap) -> Result<()> {
+        // 1) window_dimensions
+        if let Some(v) = find_array_i64(self.src, "window_dimensions")? {
+            attrs.insert("window_dimensions".into(), Attr::IntVec(v));
+        }
+        // 2) window_strides (optional)
+        if let Some(v) = find_array_i64(self.src, "window_strides")? {
+            attrs.insert("window_strides".into(), Attr::IntVec(v));
+        }
+        // 3) base_dilations (optional, default 1s)
+        if let Some(v) = find_array_i64(self.src, "base_dilations")? {
+            attrs.insert("base_dilations".into(), Attr::IntVec(v));
+        }
+        // 4) window_dilations (optional, default 1s)
+        if let Some(v) = find_array_i64(self.src, "window_dilations")? {
+            attrs.insert("window_dilations".into(), Attr::IntVec(v));
+        }
+        // 5) padding = dense<[[lo,hi], ...]> : tensor<rankx2xi64>
+        if let Some(pads) = find_padding_dense_pairs(self.src, "padding")? {
+            attrs.insert("padding".into(), Attr::PadPairs(pads));
+        }
+
+        // 6) combiner: sniff the region body for a single op
+        if let Some(body) = extract_region_body(self.src) {
+            if body.contains("stablehlo.maximum") {
+                attrs.insert("apply".into(), Attr::Id("stablehlo.maximum".into()));
+            } else if body.contains("stablehlo.minimum") {
+                attrs.insert("apply".into(), Attr::Id("stablehlo.minimum".into()));
+            } else if body.contains("stablehlo.add") {
+                attrs.insert("apply".into(), Attr::Id("stablehlo.add".into()));
+            } else if body.contains("stablehlo.multiply") {
+                attrs.insert("apply".into(), Attr::Id("stablehlo.multiply".into()));
+            }
+            // Extend as needed (logical_and/or, etc.)
         }
 
         Ok(())
@@ -449,48 +506,6 @@ fn parse_bracket_intvec(s: &str) -> Result<(Vec<usize>, usize)> {
     Err(anyhow!("bad intvec"))
 }
 
-fn parse_pad_pairs(s: &str) -> Result<Vec<(usize, usize)>> {
-    let mut pads = Vec::new();
-    let mut i = 0;
-    let b = s.as_bytes();
-    while i < s.len() {
-        if b[i] as char == '[' {
-            i += 1;
-            let mut a = String::new();
-            let mut bnum = String::new();
-            let mut reading_b = false;
-            while i < s.len() {
-                let c = b[i] as char;
-                match c {
-                    '0'..='9' => {
-                        if !reading_b {
-                            a.push(c)
-                        } else {
-                            bnum.push(c)
-                        }
-                    }
-                    ',' => {
-                        reading_b = true;
-                    }
-                    ']' => {
-                        let lo = a.parse::<usize>().unwrap_or(0);
-                        let hi = bnum.parse::<usize>().unwrap_or(0);
-                        pads.push((lo, hi));
-                        break;
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
-        }
-        if b[i] as char == ']' {
-            break;
-        }
-        i += 1;
-    }
-    Ok(pads)
-}
-
 fn parse_trailing_int(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -510,4 +525,115 @@ fn parse_trailing_int(s: &str) -> Option<(usize, usize)> {
     }
 
     None
+}
+
+fn find_array_i64(src: &str, key: &str) -> Result<Option<Vec<usize>>> {
+    if let Some(k) = src.find(key) {
+        if let Some(arr) = src[k..].find("array<i64:") {
+            let start = k + arr + "array<i64:".len();
+            if let Some(end_rel) = src[start..].find('>') {
+                let nums = &src[start..start + end_rel];
+                let v = nums
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<isize>().ok())
+                    .map(|x| usize::try_from(x).unwrap_or(0))
+                    .collect();
+                return Ok(Some(v));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn find_padding_dense_pairs(src: &str, key: &str) -> Result<Option<Vec<(usize, usize)>>> {
+    if let Some(k) = src.find(key) {
+        if let Some(d) = src[k..].find("dense<[[") {
+            let start = k + d + "dense<".len();
+            // find matching '>' after starting at 'dense<'
+            if let Some(close) = src[start..].find('>') {
+                let inner = &src[start..start + close]; // e.g. [[1, 1], [1, 1]]
+                let mut pads = Vec::new();
+                for pair in inner
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split("],")
+                    .map(|p| p.trim().trim_start_matches('[').trim_end_matches(']'))
+                {
+                    let mut it = pair
+                        .split(',')
+                        .map(|x| x.trim().parse::<usize>().unwrap_or(0));
+                    if let (Some(lo), Some(hi)) = (it.next(), it.next()) {
+                        pads.push((lo, hi));
+                    }
+                }
+                return Ok(Some(pads));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn extract_region_body(src: &str) -> Option<&str> {
+    let open = src.find("({")?;
+    let after = &src[open + 2..];
+    let close = after.rfind("})")?;
+    Some(&after[..close])
+}
+
+pub fn gather_op_blocks(src: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut cur = String::new();
+    let mut paren = 0i32;
+    let mut brace = 0i32;
+    let mut bracket = 0i32;
+    let mut in_string = false;
+
+    let mut in_block = false;
+
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if !in_block {
+            // start of an op/return
+            if trimmed.starts_with('%') || trimmed.starts_with("return") {
+                in_block = true;
+                cur.clear();
+                paren = 0;
+                brace = 0;
+                bracket = 0;
+                in_string = false;
+            } else {
+                continue;
+            }
+        }
+
+        cur.push_str(line);
+        cur.push('\n');
+
+        for ch in line.chars() {
+            if ch == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            match ch {
+                '(' => paren += 1,
+                ')' => paren -= 1,
+                '{' => brace += 1,
+                '}' => brace -= 1,
+                '[' => bracket += 1,
+                ']' => bracket -= 1,
+                _ => {}
+            }
+        }
+
+        if in_block && paren == 0 && brace == 0 && bracket == 0 {
+            blocks.push(cur.trim().to_string());
+            in_block = false;
+        }
+    }
+
+    blocks
 }
