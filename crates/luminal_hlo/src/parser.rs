@@ -43,7 +43,14 @@ impl<'a> Parser<'a> {
                         || s == "window_dilations"
                         || s == "padding"
                         || s == "batch_group_count"
-                        || s == "feature_group_count" =>
+                        || s == "feature_group_count"
+                        || s == "contracting_dims"
+                        || s == "NE"
+                        || s == "GT"
+                        || s == "GE"
+                        || s == "LT"
+                        || s == "LE"
+                        || s == "EQ" =>
                 {
                     break;
                 }
@@ -53,9 +60,8 @@ impl<'a> Parser<'a> {
                 Some(Tok::Ident(s)) if s == "init" => {
                     self.bump();
                 }
-                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen)
-                | Some(Tok::RBracket) | Some(Tok::Less) | Some(Tok::Greater)
-                | Some(Tok::LBrace) | Some(Tok::RBrace) => {
+                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen) | Some(Tok::RBracket)
+                | Some(Tok::Less) | Some(Tok::Greater) | Some(Tok::LBrace) | Some(Tok::RBrace) => {
                     self.bump();
                 }
                 other => bail!("unexpected token in operand list: {:?}", other),
@@ -117,7 +123,7 @@ impl<'a> Parser<'a> {
                     loop {
                         let start = self.expect_integer()? as usize;
                         self.expect(Tok::Colon)?;
-                        let limit = self.expect_integer()? as usize; 
+                        let limit = self.expect_integer()? as usize;
 
                         starts.push(start);
                         limits.push(limit);
@@ -138,6 +144,29 @@ impl<'a> Parser<'a> {
 
                     attrs.insert("start_indices".into(), Attr::IntVec(starts));
                     attrs.insert("end_indices".into(), Attr::IntVec(limits));
+                }
+                Some(Tok::Ident(s))
+                    if s == "NE"
+                        || s == "GT"
+                        || s == "GE"
+                        || s == "LT"
+                        || s == "LE"
+                        || s == "EQ" =>
+                {
+                    self.parse_compare_attrs(&mut operands, &mut attrs)?;
+                }
+                Some(Tok::Ident(s)) if s == "contracting_dims" => {
+                    self.bump();
+                    self.expect(Tok::Eq)?;
+
+                    let lhs = self.parse_intvec()?;
+
+                    self.expect(Tok::Ident("x".to_string()))?;
+
+                    let rhs = self.parse_intvec()?;
+
+                    attrs.insert("lhs_contracting_dims".into(), Attr::IntVec(lhs));
+                    attrs.insert("rhs_contracting_dims".into(), Attr::IntVec(rhs));
                 }
                 _ => {
                     self.bump();
@@ -304,8 +333,49 @@ impl<'a> Parser<'a> {
             } else if body.contains("stablehlo.multiply") {
                 attrs.insert("apply".into(), Attr::Id("stablehlo.multiply".into()));
             }
-            // Extend as needed (logical_and/or, etc.)
         }
+
+        Ok(())
+    }
+
+    fn parse_compare_attrs(
+        &mut self,
+        operands: &mut Vec<String>,
+        attrs: &mut AttrMap,
+    ) -> Result<()> {
+        // 1) comparison_direction enum
+        let dir = match self.bump() {
+            Some(Tok::Ident(s)) => match s.as_str() {
+                "EQ" | "NE" | "GE" | "GT" | "LE" | "LT" => s,
+                _ => bail!("stablehlo.compare: invalid comparison_direction '{}'", s),
+            },
+            other => bail!(
+                "stablehlo.compare: expected comparison_direction, got {:?}",
+                other
+            ),
+        };
+        attrs.insert("comparison_direction".into(), Attr::Id(dir));
+
+        self.expect(Tok::Comma)?;
+
+        operands.push(self.expect_percent_ident()?);
+
+        self.expect(Tok::Comma)?;
+
+        operands.push(self.expect_percent_ident()?);
+
+        self.expect(Tok::Comma)?;
+
+        let cty = match self.bump() {
+            Some(Tok::Ident(s)) => match s.as_str() {
+                "FLOAT" | "TOTALORDER" | "SIGNED" | "UNSIGNED" => s,
+                _ => bail!("stablehlo.compare: invalid compare_type '{}'", s),
+            },
+            other => bail!("stablehlo.compare: expected compare_type, got {:?}", other),
+        };
+        attrs.insert("compare_type".into(), Attr::Id(cty));
+
+        self.expect(Tok::Colon)?;
 
         Ok(())
     }

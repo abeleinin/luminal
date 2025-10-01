@@ -23,7 +23,7 @@ fn test_stablehlo_unary_ops() {
 
     cx.execute();
 
-    let expected = [1./7., 1./8.];
+    let expected = [1. / 7., 1. / 8.];
     assert_close(&inputs["%7"].data(), &expected);
 }
 
@@ -89,5 +89,35 @@ fn test_stablehlo_reduce_window() {
     cx.execute();
 
     let expected = [6.0, 8.0, 14.0, 16.0];
+    assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_compare_op() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_compare_op.mlir");
+
+    inputs["%arg0"].set([1., 2., 3., 4., 5.]);
+    inputs["%arg1"].set([1., 2., 3., 4., 5.]);
+
+    cx.execute();
+
+    // Concatenates the results of comparison ops in the following order: NE, GT, GE, LT, LE, EQ
+    let expected = [
+        0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 1., 1., 1.,
+        1., 1., 1., 1., 1., 1., 1.,
+    ];
+    assert_close(&inputs["%6"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_dot_general_op() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_dot_general_op.mlir");
+
+    inputs["%arg0"].set([1., 2., 3., 4., 5., 6.]);
+    inputs["%arg1"].set([7., 8., 9., 10., 11., 12.]);
+
+    cx.execute();
+
+    let expected = [58., 64., 139., 154.];
     assert_close(&inputs["%0"].data(), &expected);
 }

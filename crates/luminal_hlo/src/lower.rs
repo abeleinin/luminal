@@ -40,6 +40,8 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.remainder" => lower_bin_rem,
         "stablehlo.maximum" => lower_bin_max,
         "stablehlo.minimum" => lower_bin_min,
+        "stablehlo.compare" => lower_bin_compare,
+        "stablehlo.dot_general" => lower_bin_dot_general,
         // Movement
         "stablehlo.reshape" => lower_reshape,
         "stablehlo.broadcast_in_dim" => lower_broadcast_in_dim,
@@ -217,6 +219,141 @@ fn lower_bin_min(
     env.insert(op.result_name.clone(), y);
     Ok(())
 }
+fn lower_bin_compare(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let lhs = env[&op.operands[0]];
+    let rhs = env[&op.operands[1]];
+    let comparison_direction = op.attributes.get("comparison_direction");
+    match comparison_direction {
+        Some(Attr::Id(s)) => {
+            let y = match s.as_str() {
+                "NE" => lhs.ne(rhs),
+                "GT" => lhs.gt(rhs),
+                "GE" => lhs.ge(rhs),
+                "LT" => lhs.lt(rhs),
+                "LE" => lhs.le(rhs),
+                "EQ" => lhs.eq(rhs),
+                _ => bail!("compare: invalid comparison_direction"),
+            };
+            env.insert(op.result_name.clone(), y);
+        }
+        _ => bail!("compare: missing compare_type"),
+    };
+
+    Ok(())
+}
+
+fn lower_bin_dot_general(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let a = env[&op.operands[0]];
+    let b = env[&op.operands[1]];
+
+    let lhs_contracting_dims = match op.attributes.get("lhs_contracting_dims") {
+        Some(Attr::IntVec(v)) => v,
+        _ => bail!("dot_general: missing lhs_contracting_dims"),
+    };
+    let rhs_contracting_dims = match op.attributes.get("rhs_contracting_dims") {
+        Some(Attr::IntVec(v)) => v,
+        _ => bail!("dot_general: missing rhs_contracting_dims"),
+    };
+
+    let a_shape = a.shape.dims().to_vec();
+    let b_shape = b.shape.dims().to_vec();
+    let a_rank = a_shape.len();
+    let b_rank = b_shape.len();
+
+    let lhs_all: Vec<usize> = (0..a_rank).collect();
+    let rhs_all: Vec<usize> = (0..b_rank).collect();
+
+    let lhs_free: Vec<usize> = lhs_all
+        .iter()
+        .copied()
+        .filter(|d| !lhs_contracting_dims.contains(d))
+        .collect();
+    let rhs_free: Vec<usize> = rhs_all
+        .iter()
+        .copied()
+        .filter(|d| !rhs_contracting_dims.contains(d))
+        .collect();
+
+    let lhs_perm: Vec<usize> = lhs_free
+        .iter()
+        .chain(lhs_contracting_dims.iter())
+        .copied()
+        .collect();
+    let rhs_perm: Vec<usize> = rhs_contracting_dims
+        .iter()
+        .chain(rhs_free.iter())
+        .copied()
+        .collect();
+
+    let a_t = a.permute(lhs_perm);
+    let b_t = b.permute(rhs_perm);
+
+    let a_t_shape = a_t.shape.dims();
+    let b_t_shape = b_t.shape.dims();
+
+    let k_len = lhs_contracting_dims.len();
+    let l_shape = &a_t_shape[..a_t_shape.len().saturating_sub(k_len)];
+    let k_shape_l = &a_t_shape[a_t_shape.len().saturating_sub(k_len)..];
+
+    let k_shape_r = &b_t_shape[..rhs_contracting_dims.len()];
+    let r_shape = &b_t_shape[rhs_contracting_dims.len()..];
+
+    let prod = |xs: &Vec<usize>| xs.iter().copied().fold(1usize, |p, x| p.saturating_mul(x));
+
+    let k_shape_l = k_shape_l
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect::<Vec<_>>();
+    let k_shape_r = k_shape_r
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect::<Vec<_>>();
+
+    let k_l = prod(&k_shape_l);
+    let k_r = prod(&k_shape_r);
+    if k_l != k_r {
+        bail!(
+            "dot_general: contracting dims mismatch: ∏K(lhs)={} vs ∏K(rhs)={}",
+            k_l,
+            k_r
+        );
+    }
+
+    let l_shape = l_shape
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect::<Vec<_>>();
+    let r_shape = r_shape
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect::<Vec<_>>();
+
+    let m = prod(&l_shape);
+    let n = prod(&r_shape);
+    let k = k_l; // == k_r
+
+    let a_2d = a_t.reshape(&[m, k]);
+    let b_2d = b_t.reshape(&[k, n]);
+    let c_2d = a_2d.matmul(b_2d);
+
+    let mut out_shape = Vec::with_capacity(l_shape.len() + r_shape.len());
+    out_shape.extend_from_slice(&l_shape);
+    out_shape.extend_from_slice(&r_shape);
+
+    let out = c_2d.reshape(out_shape);
+
+    env.insert(op.result_name.clone(), out);
+
+    Ok(())
+}
 
 // Movement
 fn lower_reshape(
@@ -267,9 +404,9 @@ fn lower_broadcast_in_dim(
     let r_in: usize = x.shape.dims().len();
 
     if r_in == 0 {
-        let ok_dims = dims.is_empty()
-            || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
-        ensure!(ok_dims,
+        let ok_dims = dims.is_empty() || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
+        ensure!(
+            ok_dims,
             "broadcast_in_dim: scalar operand expects dims == [] (or 0..r_out-1), got {:?}",
             dims
         );
@@ -283,9 +420,20 @@ fn lower_broadcast_in_dim(
         return Ok(());
     }
 
-    ensure!(dims.len() == x.shape.dims().len(), "dims len {} != input rank {}", dims.len(), x.shape.dims().len());
-    ensure!(dims.windows(2).all(|w| w[0] < w[1]), "dims must be strictly increasing");
-    ensure!(dims.iter().all(|&d| d < r_out), "dims entries must be < out rank");
+    ensure!(
+        dims.len() == x.shape.dims().len(),
+        "dims len {} != input rank {}",
+        dims.len(),
+        x.shape.dims().len()
+    );
+    ensure!(
+        dims.windows(2).all(|w| w[0] < w[1]),
+        "dims must be strictly increasing"
+    );
+    ensure!(
+        dims.iter().all(|&d| d < r_out),
+        "dims entries must be < out rank"
+    );
 
     let dims_set: BTreeSet<_> = dims.iter().copied().collect();
     let mut y = x;
@@ -303,7 +451,12 @@ fn lower_broadcast_in_dim(
             continue;
         }
 
-        ensure!(cur == 1, "inserted axis {} has unexpected length {}", out_ax, cur);
+        ensure!(
+            cur == 1,
+            "inserted axis {} has unexpected length {}",
+            out_ax,
+            cur
+        );
         broadcast_axis(&mut y, out_ax, want);
     }
 
@@ -316,13 +469,19 @@ fn lower_concatenate(
     _g: &mut Graph,
     env: &mut HashMap<String, GraphTensor>,
 ) -> Result<()> {
-    let a = env[&op.operands[0]];
-    let b = env[&op.operands[1]];
+    let mut tensors = Vec::new();
+    for i in 0..op.operands.len() {
+        let a = env[&op.operands[i]];
+        tensors.push(a);
+    }
     let dim = match op.attributes.get("dim") {
         Some(Attr::Int(i)) => *i as usize,
         _ => 0usize,
     };
-    let y = a.concat_along(b, dim);
+    let mut y = tensors[0];
+    for i in 1..tensors.len() {
+        y = y.concat_along(tensors[i], dim);
+    }
     env.insert(op.result_name.clone(), y);
     Ok(())
 }
@@ -356,7 +515,12 @@ fn lower_slice(
             y = y.slice((start[0]..end[0], start[1]..end[1], start[2]..end[2]));
         }
         4 => {
-            y = y.slice((start[0]..end[0], start[1]..end[1], start[2]..end[2], start[3]..end[3]));
+            y = y.slice((
+                start[0]..end[0],
+                start[1]..end[1],
+                start[2]..end[2],
+                start[3]..end[3],
+            ));
         }
         _ => bail!("slice: unsupported number of dimensions"),
     };
@@ -525,7 +689,12 @@ fn pad_nchw(
     pad_right: usize,
 ) -> Result<GraphTensor> {
     // x shape: [N, C, H, W]
-    let dims = x.shape.dims().iter().map(|d| d.to_usize().unwrap()).collect::<Vec<_>>();
+    let dims = x
+        .shape
+        .dims()
+        .iter()
+        .map(|d| d.to_usize().unwrap())
+        .collect::<Vec<_>>();
     ensure!(dims.len() == 4, "pad_nchw expects NCHW rank-4 tensor");
     let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
 
@@ -538,16 +707,32 @@ fn pad_nchw(
         t
     };
 
-    let left = if pad_left > 0 { zeros((n, c, h, pad_left)) } else { x.clone() };
-    let right = if pad_right > 0 { zeros((n, c, h, pad_right)) } else { x.clone() };
+    let left = if pad_left > 0 {
+        zeros((n, c, h, pad_left))
+    } else {
+        x.clone()
+    };
+    let right = if pad_right > 0 {
+        zeros((n, c, h, pad_right))
+    } else {
+        x.clone()
+    };
     let x_hpad = if pad_left > 0 || pad_right > 0 {
         left.concat_along(x.clone(), 3).concat_along(right, 3)
     } else {
         x.clone()
     };
 
-    let top = if pad_top > 0 { zeros((n, c, pad_top, w_padded)) } else { x_hpad.clone() };
-    let bottom = if pad_bottom > 0 { zeros((n, c, pad_bottom, w_padded)) } else { x_hpad.clone() };
+    let top = if pad_top > 0 {
+        zeros((n, c, pad_top, w_padded))
+    } else {
+        x_hpad.clone()
+    };
+    let bottom = if pad_bottom > 0 {
+        zeros((n, c, pad_bottom, w_padded))
+    } else {
+        x_hpad.clone()
+    };
 
     let y = if pad_top > 0 || pad_bottom > 0 {
         top.concat_along(x_hpad.clone(), 2).concat_along(bottom, 2)
@@ -556,7 +741,12 @@ fn pad_nchw(
     };
 
     ensure!(
-        y.shape.dims().iter().map(|d| d.to_usize().unwrap()).collect::<Vec<_>>() == vec![n, c, h_padded, w_padded],
+        y.shape
+            .dims()
+            .iter()
+            .map(|d| d.to_usize().unwrap())
+            .collect::<Vec<_>>()
+            == vec![n, c, h_padded, w_padded],
         "pad_nchw produced unexpected shape"
     );
     Ok(y)
