@@ -26,8 +26,12 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.abs" => lower_unary_abs,
         "stablehlo.negate" => lower_unary_negate,
         "stablehlo.sqrt" => lower_unary_sqrt,
+        "stablehlo.rsqrt" => lower_unary_rsqrt,
         "stablehlo.log" => lower_unary_log,
         "stablehlo.exponential" => lower_unary_exp,
+        "stablehlo.convert" => lower_unary_convert,
+        "stablehlo.transpose" => lower_transpose,
+        "stablehlo.slice" => lower_slice,
         // Binary
         "stablehlo.add" => lower_bin_add,
         "stablehlo.subtract" => lower_bin_sub,
@@ -114,6 +118,24 @@ fn lower_unary_exp(
 ) -> Result<()> {
     let x = env[&op.operands[0]];
     env.insert(op.result_name.clone(), x.exp());
+    Ok(())
+}
+fn lower_unary_rsqrt(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let x = env[&op.operands[0]];
+    env.insert(op.result_name.clone(), 1.0 / x.sqrt());
+    Ok(())
+}
+fn lower_unary_convert(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    // NOTE: Everything is in f32, so this is a no-op
+    env.insert(op.result_name.clone(), env[&op.operands[0]]);
     Ok(())
 }
 
@@ -207,6 +229,19 @@ fn lower_reshape(
     env.insert(op.result_name.clone(), x.reshape(shape));
     Ok(())
 }
+fn lower_transpose(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let x = env[&op.operands[0]];
+    let dims: Vec<usize> = match op.attributes.get("dims") {
+        Some(Attr::IntVec(v)) => v.iter().map(|&u| u as usize).collect(),
+        _ => bail!("broadcast_in_dim missing 'dims' attribute"),
+    };
+    env.insert(op.result_name.clone(), x.permute(dims));
+    Ok(())
+}
 
 fn broadcast_axis(x: &mut GraphTensor, axis: usize, new_len: impl Into<Expression>) {
     let p = x.shape.indexes[axis];
@@ -232,9 +267,9 @@ fn lower_broadcast_in_dim(
     let r_in: usize = x.shape.dims().len();
 
     if r_in == 0 {
-        let ok_dims = dims.is_empty() || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
-        ensure!(
-            ok_dims,
+        let ok_dims = dims.is_empty()
+            || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
+        ensure!(ok_dims,
             "broadcast_in_dim: scalar operand expects dims == [] (or 0..r_out-1), got {:?}",
             dims
         );
@@ -248,20 +283,9 @@ fn lower_broadcast_in_dim(
         return Ok(());
     }
 
-    ensure!(
-        dims.len() == x.shape.dims().len(),
-        "dims len {} != input rank {}",
-        dims.len(),
-        x.shape.dims().len()
-    );
-    ensure!(
-        dims.windows(2).all(|w| w[0] < w[1]),
-        "dims must be strictly increasing"
-    );
-    ensure!(
-        dims.iter().all(|&d| d < r_out),
-        "dims entries must be < out rank"
-    );
+    ensure!(dims.len() == x.shape.dims().len(), "dims len {} != input rank {}", dims.len(), x.shape.dims().len());
+    ensure!(dims.windows(2).all(|w| w[0] < w[1]), "dims must be strictly increasing");
+    ensure!(dims.iter().all(|&d| d < r_out), "dims entries must be < out rank");
 
     let dims_set: BTreeSet<_> = dims.iter().copied().collect();
     let mut y = x;
@@ -279,12 +303,7 @@ fn lower_broadcast_in_dim(
             continue;
         }
 
-        ensure!(
-            cur == 1,
-            "inserted axis {} has unexpected length {}",
-            out_ax,
-            cur
-        );
+        ensure!(cur == 1, "inserted axis {} has unexpected length {}", out_ax, cur);
         broadcast_axis(&mut y, out_ax, want);
     }
 
@@ -304,6 +323,44 @@ fn lower_concatenate(
         _ => 0usize,
     };
     let y = a.concat_along(b, dim);
+    env.insert(op.result_name.clone(), y);
+    Ok(())
+}
+
+fn lower_slice(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let x = env[&op.operands[0]];
+
+    let start = match op.attributes.get("start_indices") {
+        Some(Attr::IntVec(v)) => v,
+        _ => bail!("slice missing 'start_indices' attribute"),
+    };
+
+    let end = match op.attributes.get("end_indices") {
+        Some(Attr::IntVec(v)) => v,
+        _ => bail!("slice missing 'end_indices' attribute"),
+    };
+
+    let mut y = x;
+    match start.len() {
+        1 => {
+            y = y.slice(start[0]..end[0]);
+        }
+        2 => {
+            y = y.slice((start[0]..end[0], start[1]..end[1]));
+        }
+        3 => {
+            y = y.slice((start[0]..end[0], start[1]..end[1], start[2]..end[2]));
+        }
+        4 => {
+            y = y.slice((start[0]..end[0], start[1]..end[1], start[2]..end[2], start[3]..end[3]));
+        }
+        _ => bail!("slice: unsupported number of dimensions"),
+    };
+
     env.insert(op.result_name.clone(), y);
     Ok(())
 }
@@ -468,12 +525,7 @@ fn pad_nchw(
     pad_right: usize,
 ) -> Result<GraphTensor> {
     // x shape: [N, C, H, W]
-    let dims = x
-        .shape
-        .dims()
-        .iter()
-        .map(|d| d.to_usize().unwrap())
-        .collect::<Vec<_>>();
+    let dims = x.shape.dims().iter().map(|d| d.to_usize().unwrap()).collect::<Vec<_>>();
     ensure!(dims.len() == 4, "pad_nchw expects NCHW rank-4 tensor");
     let (n, c, h, w) = (dims[0], dims[1], dims[2], dims[3]);
 
@@ -486,32 +538,16 @@ fn pad_nchw(
         t
     };
 
-    let left = if pad_left > 0 {
-        zeros((n, c, h, pad_left))
-    } else {
-        x.clone()
-    };
-    let right = if pad_right > 0 {
-        zeros((n, c, h, pad_right))
-    } else {
-        x.clone()
-    };
+    let left = if pad_left > 0 { zeros((n, c, h, pad_left)) } else { x.clone() };
+    let right = if pad_right > 0 { zeros((n, c, h, pad_right)) } else { x.clone() };
     let x_hpad = if pad_left > 0 || pad_right > 0 {
         left.concat_along(x.clone(), 3).concat_along(right, 3)
     } else {
         x.clone()
     };
 
-    let top = if pad_top > 0 {
-        zeros((n, c, pad_top, w_padded))
-    } else {
-        x_hpad.clone()
-    };
-    let bottom = if pad_bottom > 0 {
-        zeros((n, c, pad_bottom, w_padded))
-    } else {
-        x_hpad.clone()
-    };
+    let top = if pad_top > 0 { zeros((n, c, pad_top, w_padded)) } else { x_hpad.clone() };
+    let bottom = if pad_bottom > 0 { zeros((n, c, pad_bottom, w_padded)) } else { x_hpad.clone() };
 
     let y = if pad_top > 0 || pad_bottom > 0 {
         top.concat_along(x_hpad.clone(), 2).concat_along(bottom, 2)
@@ -520,12 +556,7 @@ fn pad_nchw(
     };
 
     ensure!(
-        y.shape
-            .dims()
-            .iter()
-            .map(|d| d.to_usize().unwrap())
-            .collect::<Vec<_>>()
-            == vec![n, c, h_padded, w_padded],
+        y.shape.dims().iter().map(|d| d.to_usize().unwrap()).collect::<Vec<_>>() == vec![n, c, h_padded, w_padded],
         "pad_nchw produced unexpected shape"
     );
     Ok(y)

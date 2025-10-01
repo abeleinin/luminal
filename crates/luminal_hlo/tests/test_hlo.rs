@@ -19,12 +19,12 @@ fn test_stablehlo_binary_ops() {
 fn test_stablehlo_unary_ops() {
     let (mut cx, inputs) = import_hlo("tests/data/stablehlo_unary_ops.mlir");
 
-    inputs["%arg0"].set([[49., 64.], [25., 36.]]);
+    inputs["%arg0"].set([[2401., 4096.], [625., 1296.]]);
 
     cx.execute();
 
-    let expected = [7., 8., 5., 6.];
-    assert_close(&inputs["%4"].data(), &expected);
+    let expected = [1./7., 1./8.];
+    assert_close(&inputs["%7"].data(), &expected);
 }
 
 #[test]
@@ -36,7 +36,7 @@ fn test_stablehlo_constant_op() {
     cx.execute();
 
     let expected = [169., 169., 169., 169.];
-    assert_close(&inputs["%0"].data(), &expected);
+    assert_close(&inputs["%2"].data(), &expected);
 }
 
 #[test]

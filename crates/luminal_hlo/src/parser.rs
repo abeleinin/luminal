@@ -47,10 +47,13 @@ impl<'a> Parser<'a> {
                 {
                     break;
                 }
+                Some(Tok::LBracket) if name == "stablehlo.slice" => {
+                    break;
+                }
                 Some(Tok::Ident(s)) if s == "init" => {
                     self.bump();
                 }
-                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen) | Some(Tok::LBracket)
+                Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen)
                 | Some(Tok::RBracket) | Some(Tok::Less) | Some(Tok::Greater)
                 | Some(Tok::LBrace) | Some(Tok::RBrace) => {
                     self.bump();
@@ -104,6 +107,37 @@ impl<'a> Parser<'a> {
                     if let Some(Tok::Integer(v)) = self.peek() {
                         attrs.insert("dense".into(), Attr::Int(v.clone()));
                     }
+                }
+                Some(Tok::LBracket) if name == "stablehlo.slice" => {
+                    self.expect(Tok::LBracket)?;
+
+                    let mut starts: Vec<usize> = Vec::new();
+                    let mut limits: Vec<usize> = Vec::new();
+
+                    loop {
+                        let start = self.expect_integer()? as usize;
+                        self.expect(Tok::Colon)?;
+                        let limit = self.expect_integer()? as usize; 
+
+                        starts.push(start);
+                        limits.push(limit);
+
+                        match self.peek() {
+                            Some(Tok::Comma) => {
+                                self.bump();
+                            }
+                            Some(Tok::RBracket) => {
+                                self.bump();
+                                break;
+                            }
+                            other => {
+                                bail!("expected ',' or ']' in slice ranges, found {:?}", other);
+                            }
+                        }
+                    }
+
+                    attrs.insert("start_indices".into(), Attr::IntVec(starts));
+                    attrs.insert("end_indices".into(), Attr::IntVec(limits));
                 }
                 _ => {
                     self.bump();
