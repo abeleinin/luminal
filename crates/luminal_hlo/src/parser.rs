@@ -185,6 +185,8 @@ impl<'a> Parser<'a> {
             if let Some(pos) = self.src.find("->") {
                 result_type_src = self.src[pos + 2..].trim().to_string();
             }
+        } else if let Some(pos) = self.src.find(":") {
+            result_type_src = self.src[pos + 1..].trim().to_string();
         }
 
         Ok(Operation {
@@ -476,7 +478,7 @@ pub fn parse_output_shape_from_op(op_line: &str) -> Vec<usize> {
     }
 }
 
-fn parse_tensor_shape(tensor_type_str: &str) -> Vec<usize> {
+pub fn parse_tensor_shape(tensor_type_str: &str) -> Vec<usize> {
     if let Some(start) = tensor_type_str.find('<') {
         if let Some(end) = tensor_type_str.find('>') {
             let shape_str = &tensor_type_str[start + 1..end];

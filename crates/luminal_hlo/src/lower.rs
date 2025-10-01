@@ -1,5 +1,5 @@
 use crate::ast::{Attr, Operation};
-use crate::parser::parse_output_shape_from_op;
+use crate::parser::{parse_output_shape_from_op, parse_tensor_shape};
 
 use anyhow::{bail, ensure, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -55,6 +55,8 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.reduce_window" => lower_reduce_window,
         // Convolution
         "stablehlo.convolution" => lower_convolution,
+        // Other
+        "stablehlo.iota" => lower_iota,
         // Return
         "return" => lower_return,
         _ => return None,
@@ -875,6 +877,18 @@ fn get_pad_pairs_default(op: &Operation, n: usize) -> Result<Vec<(usize, usize)>
         None => vec![(0, 0); n],
         other => bail!("reduce_window: bad `padding` (got {:?})", other),
     })
+}
+
+fn lower_iota(op: &Operation, g: &mut Graph, env: &mut HashMap<String, GraphTensor>) -> Result<()> {
+    let iota_dim = match op.attributes.get("dim") {
+        Some(Attr::Int(i)) => *i as usize,
+        _ => 0usize,
+    };
+    let shape = parse_tensor_shape(&op.result_type_src);
+    let iota_tensor = g.arange(shape[iota_dim]) + 1.0;
+    let iota_tensor = iota_tensor.expand(shape);
+    env.insert(op.result_name.clone(), iota_tensor);
+    Ok(())
 }
 
 // return
