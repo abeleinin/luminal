@@ -42,6 +42,8 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.minimum" => lower_bin_min,
         "stablehlo.compare" => lower_bin_compare,
         "stablehlo.dot_general" => lower_bin_dot_general,
+        // Ternary
+        "stablehlo.select" => lower_select,
         // Movement
         "stablehlo.reshape" => lower_reshape,
         "stablehlo.broadcast_in_dim" => lower_broadcast_in_dim,
@@ -53,7 +55,7 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.reduce_window" => lower_reduce_window,
         // Convolution
         "stablehlo.convolution" => lower_convolution,
-        // Pseudo
+        // Return
         "return" => lower_return,
         _ => return None,
     };
@@ -352,6 +354,21 @@ fn lower_bin_dot_general(
 
     env.insert(op.result_name.clone(), out);
 
+    Ok(())
+}
+
+// Ternary
+fn lower_select(
+    op: &Operation,
+    _g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let pred = env[&op.operands[0]];
+    let on_true = env[&op.operands[1]];
+    let on_false = env[&op.operands[2]];
+
+    let out = on_false + pred * (on_true - on_false);
+    env.insert(op.result_name.clone(), out);
     Ok(())
 }
 

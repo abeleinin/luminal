@@ -3,6 +3,19 @@ use luminal_hlo::import_hlo;
 luminal::test_imports!();
 
 #[test]
+fn test_stablehlo_unary_ops() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_unary_ops.mlir");
+
+    inputs["%arg0"].set([[2401., 4096.], [625., 1296.]]);
+
+    cx.execute();
+
+    let expected = [1. / 7., 1. / 8.];
+    assert_close(&inputs["%7"].data(), &expected);
+}
+
+
+#[test]
 fn test_stablehlo_binary_ops() {
     let (mut cx, inputs) = import_hlo("tests/data/stablehlo_binary_ops.mlir");
 
@@ -16,15 +29,17 @@ fn test_stablehlo_binary_ops() {
 }
 
 #[test]
-fn test_stablehlo_unary_ops() {
-    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_unary_ops.mlir");
+fn test_stablehlo_ternary_ops() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_ternary_ops.mlir");
 
-    inputs["%arg0"].set([[2401., 4096.], [625., 1296.]]);
+    inputs["%arg0"].set([0., 1., 0., 1., 0.]);
+    inputs["%arg1"].set([10., 20., 30., 40., 50.]);
+    inputs["%arg2"].set([1., 2., 3., 4., 5.]);
 
     cx.execute();
 
-    let expected = [1. / 7., 1. / 8.];
-    assert_close(&inputs["%7"].data(), &expected);
+    let expected = [1., 20., 3., 40., 5.];
+    assert_close(&inputs["%0"].data(), &expected);
 }
 
 #[test]
