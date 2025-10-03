@@ -703,22 +703,43 @@ fn lower_constant(
     Ok(())
 }
 
-// Reduce (sum only)
+// Reduce
 fn lower_reduce(
     op: &Operation,
-    _g: &mut Graph,
+    g: &mut Graph,
     env: &mut HashMap<String, GraphTensor>,
 ) -> Result<()> {
     let x = env[&op.operands[0]];
+    let init = env[&op.operands[1]];
+
+    let mut dims = match (op.attributes.get("dimensions"), op.attributes.get("dims")) {
+        (Some(Attr::IntVec(v)), _) | (_, Some(Attr::IntVec(v))) => v.clone(),
+        _ => vec![],
+    };
+
+    // NOTE: Luminal sum() op does not support unsorted dimensions
+    dims.sort();
+
     match op.attributes.get("apply") {
         Some(Attr::Id(s)) if s == "stablehlo.add" => {
-            let mut dims = match (op.attributes.get("dimensions"), op.attributes.get("dims")) {
-                (Some(Attr::IntVec(v)), _) | (_, Some(Attr::IntVec(v))) => v.clone(),
-                _ => vec![],
-            };
-            // TODO: Luminal sum does not support unsorted dimensions
-            dims.sort();
             let y = x.sum(dims);
+            env.insert(op.result_name.clone(), y);
+            Ok(())
+        }
+        Some(Attr::Id(s)) if s == "stablehlo.or" => {
+            let zero_tensor = g.constant(0.0).expand(x.shape).retrieve();
+            let x_bool = x.ne(zero_tensor);
+            let reduced = x_bool.max(dims);
+            let y = reduced.maximum(init.expand(reduced.shape));
+
+            env.insert(op.result_name.clone(), y);
+            Ok(())
+        }
+        Some(Attr::Id(s)) if s == "stablehlo.maximum" => {
+            let reduced = x.max(dims);
+            let init_b = init.expand(reduced.shape);
+            let y = reduced.maximum(init_b);
+
             env.insert(op.result_name.clone(), y);
             Ok(())
         }

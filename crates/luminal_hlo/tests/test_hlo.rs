@@ -61,8 +61,8 @@ fn test_stablehlo_broadcast_in_dim_op() {
 
     cx.execute();
 
-    let expected = [160.];
-    assert_close(&inputs["%3"].data(), &expected);
+    let expected = [20., 20., 20., 20., 20., 20., 20., 20.];
+    assert_close(&inputs["%2"].data(), &expected);
 }
 
 #[test]
@@ -158,4 +158,17 @@ fn test_stablehlo_dot_general_op_batching() {
 
     let expected = [4., 5., 10., 11., 76., 100., 6., 8.];
     assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_reduce_op() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_reduce_op.mlir");
+
+    inputs["%arg0"].set([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, -1.0, 2.0, 7.0, 7.0, -3.0]);
+    inputs["%arg1"].set([0., 1., 0., 0., 0., 0., 1., 1., 0., 0., 0., 1.]);
+
+    cx.execute();
+
+    let expected = [6., 3., 1., 15., 6., 0., 1., 2., 1., 11., 7., 1.];
+    assert_close(&inputs["%6"].data(), &expected);
 }
