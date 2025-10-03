@@ -36,6 +36,7 @@ impl<'a> Parser<'a> {
                         || s == "dims"
                         || s == "dim_numbers"
                         || s == "apply"
+                        || s == "applies"
                         || s == "dense"
                         || s == "window_dimensions"
                         || s == "window_strides"
@@ -45,6 +46,7 @@ impl<'a> Parser<'a> {
                         || s == "batch_group_count"
                         || s == "feature_group_count"
                         || s == "contracting_dims"
+                        || s == "batching_dims"
                         || s == "NE"
                         || s == "GT"
                         || s == "GE"
@@ -58,6 +60,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some(Tok::Ident(s)) if s == "init" => {
+                    self.bump();
                     self.bump();
                 }
                 Some(Tok::Comma) | Some(Tok::LParen) | Some(Tok::RParen) | Some(Tok::RBracket)
@@ -113,6 +116,13 @@ impl<'a> Parser<'a> {
                     if let Some(Tok::Integer(v)) = self.peek() {
                         attrs.insert("dense".into(), Attr::Int(v.clone()));
                     }
+                    if let Some(Tok::Ident(s)) = self.peek() {
+                        if s == "true" {
+                            attrs.insert("dense".into(), Attr::Int(1));
+                        } else if s == "false" {
+                            attrs.insert("dense".into(), Attr::Int(0));
+                        }
+                    }
                 }
                 Some(Tok::LBracket) if name == "stablehlo.slice" => {
                     self.expect(Tok::LBracket)?;
@@ -160,13 +170,22 @@ impl<'a> Parser<'a> {
                     self.expect(Tok::Eq)?;
 
                     let lhs = self.parse_intvec()?;
-
                     self.expect(Tok::Ident("x".to_string()))?;
-
                     let rhs = self.parse_intvec()?;
 
                     attrs.insert("lhs_contracting_dims".into(), Attr::IntVec(lhs));
                     attrs.insert("rhs_contracting_dims".into(), Attr::IntVec(rhs));
+                }
+                Some(Tok::Ident(s)) if s == "batching_dims" => {
+                    self.bump();
+                    self.expect(Tok::Eq)?;
+
+                    let lhs = self.parse_intvec()?;
+                    self.expect(Tok::Ident("x".to_string()))?;
+                    let rhs = self.parse_intvec()?;
+
+                    attrs.insert("lhs_batching_dims".into(), Attr::IntVec(lhs));
+                    attrs.insert("rhs_batching_dims".into(), Attr::IntVec(rhs));
                 }
                 _ => {
                     self.bump();
@@ -365,6 +384,10 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Comma)?;
 
         operands.push(self.expect_percent_ident()?);
+
+        if self.peek() == Some(&Tok::Colon) {
+            return Ok(());
+        }
 
         self.expect(Tok::Comma)?;
 

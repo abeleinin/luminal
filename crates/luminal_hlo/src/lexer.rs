@@ -4,6 +4,7 @@ pub enum Tok {
     Ident(String),
     Integer(i64),
     Float(f64),
+    Bool(bool),
     LParen,
     RParen,
     LBracket,
@@ -93,8 +94,18 @@ impl<'a> Lexer<'a> {
                         self.i += 2;
                         out.push(Tok::Arrow);
                     } else {
-                        let ident = self.lex_ident();
-                        out.push(Tok::Ident(ident));
+                        if let Some(n) = self.bytes.get(self.i + 1).copied() {
+                            if n.is_ascii_digit() || n == b'.' {
+                                let num = self.lex_number();
+                                out.push(num);
+                            } else {
+                                let ident = self.lex_ident();
+                                out.push(ident_to_tok(ident));
+                            }
+                        } else {
+                            let ident = self.lex_ident();
+                            out.push(ident_to_tok(ident));
+                        }
                     }
                 }
                 '%' => {
@@ -162,22 +173,33 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) -> Tok {
         let start = self.i;
+        let mut sign = 1;
 
-        if self.peek() == Some(b'0') {
+        if self.peek() == Some(b'-') {
+            sign = -1;
             self.bump();
-            if let Some(b'x') | Some(b'X') = self.peek() {
-                self.bump();
-                let hex_start = self.i;
-                self.eat_while(|c| c.is_ascii_hexdigit());
-                let text = &self.s[hex_start..self.i];
-                let value = i64::from_str_radix(text, 16).unwrap();
-                return Tok::Integer(value);
-            } else {
-                self.i = start;
+        }
+
+        // Optional 0x... (hex integer)
+        if self.peek() == Some(b'0') {
+            let save = self.i;
+            self.bump();
+            match self.peek() {
+                Some(b'x') | Some(b'X') => {
+                    self.bump();
+                    let hex_start = self.i;
+                    self.eat_while(|c| c.is_ascii_hexdigit());
+                    let text = &self.s[hex_start..self.i];
+                    let value = i64::from_str_radix(text, 16).unwrap();
+                    return Tok::Integer(value * sign);
+                }
+                _ => {
+                    self.i = save;
+                }
             }
         }
 
-        // decimal/float path
+        // integer part
         self.eat_while(|c| c.is_ascii_digit());
 
         let mut is_float = false;
@@ -190,23 +212,28 @@ impl<'a> Lexer<'a> {
         }
 
         // exponent part
-        if let Some(b'e') | Some(b'E') = self.peek() {
+        if matches!(self.peek(), Some(b'e' | b'E')) {
             is_float = true;
             self.bump();
-
-            if let Some(b'+' | b'-') = self.peek() {
+            if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.bump();
             }
-
             self.eat_while(|c| c.is_ascii_digit());
         }
 
         let text = &self.s[start..self.i];
-
         if is_float {
             Tok::Float(text.parse::<f64>().unwrap())
         } else {
             Tok::Integer(text.parse::<i64>().unwrap())
         }
+    }
+}
+
+fn ident_to_tok(ident: String) -> Tok {
+    match ident.as_str() {
+        "true" => Tok::Bool(true),
+        "false" => Tok::Bool(false),
+        _ => Tok::Ident(ident),
     }
 }

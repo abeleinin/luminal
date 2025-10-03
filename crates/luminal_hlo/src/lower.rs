@@ -2,7 +2,7 @@ use crate::ast::{Attr, Operation};
 use crate::parser::{parse_output_shape_from_op, parse_tensor_shape};
 
 use anyhow::{bail, ensure, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use luminal::prelude::*;
 use luminal_nn::Conv2D;
@@ -32,6 +32,7 @@ fn lookup(op: &str) -> Option<LowerFn> {
         "stablehlo.convert" => lower_unary_convert,
         "stablehlo.transpose" => lower_transpose,
         "stablehlo.slice" => lower_slice,
+        "stablehlo.not" => lower_unary_not,
         // Binary
         "stablehlo.add" => lower_bin_add,
         "stablehlo.subtract" => lower_bin_sub,
@@ -229,7 +230,10 @@ fn lower_bin_compare(
     env: &mut HashMap<String, GraphTensor>,
 ) -> Result<()> {
     let lhs = env[&op.operands[0]];
-    let rhs = env[&op.operands[1]];
+    let mut rhs = env[&op.operands[1]];
+    if lhs.shape.dims().len() != rhs.shape.dims().len() {
+        rhs = rhs.expand(lhs.shape);
+    }
     let comparison_direction = op.attributes.get("comparison_direction");
     match comparison_direction {
         Some(Attr::Id(s)) => {
@@ -250,7 +254,7 @@ fn lower_bin_compare(
     Ok(())
 }
 
-fn lower_bin_dot_general(
+pub fn lower_bin_dot_general(
     op: &Operation,
     _g: &mut Graph,
     env: &mut HashMap<String, GraphTensor>,
@@ -259,40 +263,120 @@ fn lower_bin_dot_general(
     let b = env[&op.operands[1]];
 
     let lhs_contracting_dims = match op.attributes.get("lhs_contracting_dims") {
-        Some(Attr::IntVec(v)) => v,
+        Some(Attr::IntVec(v)) => v.clone(),
         _ => bail!("dot_general: missing lhs_contracting_dims"),
     };
     let rhs_contracting_dims = match op.attributes.get("rhs_contracting_dims") {
-        Some(Attr::IntVec(v)) => v,
+        Some(Attr::IntVec(v)) => v.clone(),
         _ => bail!("dot_general: missing rhs_contracting_dims"),
     };
+    let lhs_batching_dims: Vec<usize> = match op.attributes.get("lhs_batching_dims") {
+        Some(Attr::IntVec(v)) => v.clone(),
+        _ => vec![],
+    };
+    let rhs_batching_dims: Vec<usize> = match op.attributes.get("rhs_batching_dims") {
+        Some(Attr::IntVec(v)) => v.clone(),
+        _ => vec![],
+    };
 
-    let a_shape = a.shape.dims().to_vec();
-    let b_shape = b.shape.dims().to_vec();
+    let a_shape: Vec<usize> = a
+        .shape
+        .dims()
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect();
+    let b_shape: Vec<usize> = b
+        .shape
+        .dims()
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect();
+
     let a_rank = a_shape.len();
     let b_rank = b_shape.len();
 
-    let lhs_all: Vec<usize> = (0..a_rank).collect();
-    let rhs_all: Vec<usize> = (0..b_rank).collect();
+    let is_unique = |v: &[usize]| {
+        let mut h = HashSet::with_capacity(v.len());
+        v.iter().all(|x| h.insert(*x))
+    };
 
-    let lhs_free: Vec<usize> = lhs_all
-        .iter()
-        .copied()
-        .filter(|d| !lhs_contracting_dims.contains(d))
+    let in_range = |all_len: usize, v: &[usize]| v.iter().all(|&d| d < all_len);
+
+    if lhs_batching_dims.len() != rhs_batching_dims.len() {
+        bail!(
+            "dot_general: (C1) batch dims length mismatch: lhs={} rhs={}",
+            lhs_batching_dims.len(),
+            rhs_batching_dims.len()
+        );
+    }
+    if lhs_contracting_dims.len() != rhs_contracting_dims.len() {
+        bail!(
+            "dot_general: (C2) contracting dims length mismatch: lhs={} rhs={}",
+            lhs_contracting_dims.len(),
+            rhs_contracting_dims.len()
+        );
+    }
+
+    {
+        let mut lhs_all = lhs_batching_dims.clone();
+        lhs_all.extend(&lhs_contracting_dims);
+        if !is_unique(&lhs_all) {
+            bail!("dot_general: (C3) lhs batching+contracting must be unique");
+        }
+
+        let mut rhs_all = rhs_batching_dims.clone();
+        rhs_all.extend(&rhs_contracting_dims);
+        if !is_unique(&rhs_all) {
+            bail!("dot_general: (C4) rhs batching+contracting must be unique");
+        }
+    }
+
+    if !in_range(a_rank, &lhs_batching_dims) {
+        bail!("dot_general: (C5) lhs batching out of range");
+    }
+    if !in_range(a_rank, &lhs_contracting_dims) {
+        bail!("dot_general: (C6) lhs contracting out of range");
+    }
+    if !in_range(b_rank, &rhs_batching_dims) {
+        bail!("dot_general: (C7) rhs batching out of range");
+    }
+    if !in_range(b_rank, &rhs_contracting_dims) {
+        bail!("dot_general: (C8) rhs contracting out of range");
+    }
+
+    for (ld, rd) in lhs_batching_dims.iter().zip(rhs_batching_dims.iter()) {
+        if a_shape[*ld] != b_shape[*rd] {
+            bail!("dot_general: (C9) batch dim size mismatch: lhs axis {} (size {}) vs rhs axis {} (size {})",
+                  ld, a_shape[*ld], rd, b_shape[*rd]);
+        }
+    }
+
+    for (ld, rd) in lhs_contracting_dims.iter().zip(rhs_contracting_dims.iter()) {
+        if a_shape[*ld] != b_shape[*rd] {
+            bail!("dot_general: (C10) contracting size mismatch: lhs axis {} (size {}) vs rhs axis {} (size {})",
+                  ld, a_shape[*ld], rd, b_shape[*rd]);
+        }
+    }
+
+    let contains = |set: &[usize], x: usize| set.iter().any(|&d| d == x);
+
+    let lhs_free: Vec<usize> = (0..a_rank)
+        .filter(|d| !contains(&lhs_batching_dims, *d) && !contains(&lhs_contracting_dims, *d))
         .collect();
-    let rhs_free: Vec<usize> = rhs_all
-        .iter()
-        .copied()
-        .filter(|d| !rhs_contracting_dims.contains(d))
+    let rhs_free: Vec<usize> = (0..b_rank)
+        .filter(|d| !contains(&rhs_batching_dims, *d) && !contains(&rhs_contracting_dims, *d))
         .collect();
 
-    let lhs_perm: Vec<usize> = lhs_free
+    let lhs_perm: Vec<usize> = lhs_batching_dims
         .iter()
+        .chain(lhs_free.iter())
         .chain(lhs_contracting_dims.iter())
         .copied()
         .collect();
-    let rhs_perm: Vec<usize> = rhs_contracting_dims
+
+    let rhs_perm: Vec<usize> = rhs_batching_dims
         .iter()
+        .chain(rhs_contracting_dims.iter())
         .chain(rhs_free.iter())
         .copied()
         .collect();
@@ -300,62 +384,99 @@ fn lower_bin_dot_general(
     let a_t = a.permute(lhs_perm);
     let b_t = b.permute(rhs_perm);
 
-    let a_t_shape = a_t.shape.dims();
-    let b_t_shape = b_t.shape.dims();
+    let a_t_shape: Vec<usize> = a_t
+        .shape
+        .dims()
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect();
+    let b_t_shape: Vec<usize> = b_t
+        .shape
+        .dims()
+        .iter()
+        .map(|x| x.to_usize().unwrap())
+        .collect();
 
+    let b_len = lhs_batching_dims.len();
     let k_len = lhs_contracting_dims.len();
-    let l_shape = &a_t_shape[..a_t_shape.len().saturating_sub(k_len)];
-    let k_shape_l = &a_t_shape[a_t_shape.len().saturating_sub(k_len)..];
 
-    let k_shape_r = &b_t_shape[..rhs_contracting_dims.len()];
-    let r_shape = &b_t_shape[rhs_contracting_dims.len()..];
+    let a_b = &a_t_shape[0..b_len];
+    let a_l = &a_t_shape[b_len..a_t_shape.len() - k_len];
+    let a_k = &a_t_shape[a_t_shape.len() - k_len..];
 
-    let prod = |xs: &Vec<usize>| xs.iter().copied().fold(1usize, |p, x| p.saturating_mul(x));
+    let b_b = &b_t_shape[0..b_len];
+    let b_k = &b_t_shape[b_len..b_len + k_len];
+    let b_r = &b_t_shape[b_len + k_len..];
 
-    let k_shape_l = k_shape_l
-        .iter()
-        .map(|x| x.to_usize().unwrap())
-        .collect::<Vec<_>>();
-    let k_shape_r = k_shape_r
-        .iter()
-        .map(|x| x.to_usize().unwrap())
-        .collect::<Vec<_>>();
+    for i in 0..b_len {
+        if a_b[i] != b_b[i] {
+            bail!(
+                "dot_general: batch size mismatch after permute at {}: lhs={} rhs={}",
+                i,
+                a_b[i],
+                b_b[i]
+            );
+        }
+    }
 
-    let k_l = prod(&k_shape_l);
-    let k_r = prod(&k_shape_r);
-    if k_l != k_r {
+    let product = |xs: &[usize]| xs.iter().copied().fold(1usize, |p, x| p.saturating_mul(x));
+
+    if product(a_k) != product(b_k) {
         bail!(
-            "dot_general: contracting dims mismatch: ∏K(lhs)={} vs ∏K(rhs)={}",
-            k_l,
-            k_r
+            "dot_general: contracting product mismatch after permute: lhs={} rhs={}",
+            product(a_k),
+            product(b_k)
         );
     }
 
-    let l_shape = l_shape
-        .iter()
-        .map(|x| x.to_usize().unwrap())
-        .collect::<Vec<_>>();
-    let r_shape = r_shape
-        .iter()
-        .map(|x| x.to_usize().unwrap())
-        .collect::<Vec<_>>();
+    if b_len == 0 {
+        let m = product(a_l);
+        let n = product(b_r);
+        let k = product(a_k);
 
-    let m = prod(&l_shape);
-    let n = prod(&r_shape);
-    let k = k_l; // == k_r
+        let a_2d = a_t.reshape(&[m, k]);
+        let b_2d = b_t.reshape(&[k, n]);
+        let c_2d = a_2d.matmul(b_2d);
 
-    let a_2d = a_t.reshape(&[m, k]);
-    let b_2d = b_t.reshape(&[k, n]);
-    let c_2d = a_2d.matmul(b_2d);
+        // Output shape is [L..., R...] in that order
+        let mut out_shape = Vec::with_capacity(a_l.len() + b_r.len());
+        out_shape.extend_from_slice(a_l);
+        out_shape.extend_from_slice(b_r);
 
-    let mut out_shape = Vec::with_capacity(l_shape.len() + r_shape.len());
-    out_shape.extend_from_slice(&l_shape);
-    out_shape.extend_from_slice(&r_shape);
+        let out = c_2d.reshape(out_shape);
+        env.insert(op.result_name.clone(), out);
+        return Ok(());
+    }
 
-    let out = c_2d.reshape(out_shape);
+    let mut target_shape = Vec::with_capacity(a_b.len() + a_l.len() + a_k.len() + b_r.len());
+    target_shape.extend_from_slice(a_b);
+    target_shape.extend_from_slice(a_l);
+    target_shape.extend_from_slice(a_k);
+    target_shape.extend_from_slice(b_r);
 
-    env.insert(op.result_name.clone(), out);
+    let a_broadcast_dims: Vec<usize> = (0..(b_len + a_l.len() + a_k.len())).collect();
 
+    let mut b_broadcast_dims = Vec::with_capacity(b_len + b_k.len() + b_r.len());
+    b_broadcast_dims.extend(0..b_len);
+
+    let k_start = b_len + a_l.len();
+    b_broadcast_dims.extend(k_start..k_start + a_k.len());
+
+    let r_start = k_start + a_k.len();
+    b_broadcast_dims.extend(r_start..r_start + b_r.len());
+
+    let a_bc = broadcast_in_dim_like(a_t, &target_shape, &a_broadcast_dims)?;
+    let b_bc = broadcast_in_dim_like(b_t, &target_shape, &b_broadcast_dims)?;
+
+    let prod_el = a_bc * b_bc;
+    let k_axes: Vec<usize> = {
+        let start = b_len + a_l.len();
+        (start..start + a_k.len()).collect()
+    };
+
+    let out_blr = prod_el.sum(k_axes);
+
+    env.insert(op.result_name.clone(), out_blr);
     Ok(())
 }
 
@@ -405,10 +526,76 @@ fn broadcast_axis(x: &mut GraphTensor, axis: usize, new_len: impl Into<Expressio
     x.shape.fake[p] = true;
 }
 
+pub fn broadcast_in_dim_like(
+    mut x: GraphTensor,
+    out_shape: &[usize],
+    dims: &[usize],
+) -> Result<GraphTensor> {
+    let r_out = out_shape.len();
+    let r_in = x.shape.dims().len();
+
+    if r_in == 0 {
+        let ok_dims = dims.is_empty() || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
+        ensure!(
+            ok_dims,
+            "broadcast_in_dim: scalar expects dims == [] or 0..r_out-1; got {:?}",
+            dims
+        );
+
+        // Repeatedly insert axes and broadcast each to out_shape
+        for ax in 0..r_out {
+            x = x.expand_dim(ax, 1);
+            broadcast_axis(&mut x, ax, out_shape[ax]);
+        }
+        return Ok(x);
+    }
+
+    ensure!(
+        dims.len() == r_in,
+        "broadcast_in_dim_like: dims len {} != input rank {}",
+        dims.len(),
+        r_in
+    );
+    ensure!(
+        dims.windows(2).all(|w| w[0] < w[1]),
+        "broadcast_in_dim_like: dims must be strictly increasing"
+    );
+    ensure!(
+        dims.iter().all(|&d| d < r_out),
+        "broadcast_in_dim_like: dims entries must be < out rank"
+    );
+
+    // Insert the missing axes (those not mentioned in dims) as size-1
+    let dims_set: BTreeSet<_> = dims.iter().copied().collect();
+    for out_ax in 0..r_out {
+        if !dims_set.contains(&out_ax) {
+            x = x.expand_dim(out_ax, 1);
+        }
+    }
+
+    for out_ax in 0..r_out {
+        let want = out_shape[out_ax];
+        let cur = x.shape.dims()[out_ax];
+        if cur == want {
+            continue;
+        }
+        ensure!(
+            cur == 1,
+            "broadcast_in_dim_like: axis {} has length {}, cannot broadcast to {}",
+            out_ax,
+            cur,
+            want
+        );
+        broadcast_axis(&mut x, out_ax, want);
+    }
+
+    Ok(x)
+}
+
 fn lower_broadcast_in_dim(
     op: &Operation,
     _g: &mut Graph,
-    env: &mut std::collections::HashMap<String, GraphTensor>,
+    env: &mut HashMap<String, GraphTensor>,
 ) -> Result<()> {
     let x = env[&op.operands[0]];
 
@@ -418,66 +605,7 @@ fn lower_broadcast_in_dim(
     };
 
     let out_shape: Vec<usize> = parse_output_shape_from_op(&op.result_type_src);
-    let r_out = out_shape.len();
-
-    let r_in: usize = x.shape.dims().len();
-
-    if r_in == 0 {
-        let ok_dims = dims.is_empty() || (dims.len() == r_out && dims.iter().copied().eq(0..r_out));
-        ensure!(
-            ok_dims,
-            "broadcast_in_dim: scalar operand expects dims == [] (or 0..r_out-1), got {:?}",
-            dims
-        );
-
-        let mut y = x;
-        for ax in 0..r_out {
-            y = y.expand_dim(ax, 1);
-            broadcast_axis(&mut y, ax, out_shape[ax]);
-        }
-        env.insert(op.result_name.clone(), y);
-        return Ok(());
-    }
-
-    ensure!(
-        dims.len() == x.shape.dims().len(),
-        "dims len {} != input rank {}",
-        dims.len(),
-        x.shape.dims().len()
-    );
-    ensure!(
-        dims.windows(2).all(|w| w[0] < w[1]),
-        "dims must be strictly increasing"
-    );
-    ensure!(
-        dims.iter().all(|&d| d < r_out),
-        "dims entries must be < out rank"
-    );
-
-    let dims_set: BTreeSet<_> = dims.iter().copied().collect();
-    let mut y = x;
-    for ax in 0..r_out {
-        if !dims_set.contains(&ax) {
-            y = y.expand_dim(ax, 1);
-        }
-    }
-
-    for out_ax in 0..r_out {
-        let want = out_shape[out_ax];
-        let cur = y.shape.dims()[out_ax];
-
-        if cur == want {
-            continue;
-        }
-
-        ensure!(
-            cur == 1,
-            "inserted axis {} has unexpected length {}",
-            out_ax,
-            cur
-        );
-        broadcast_axis(&mut y, out_ax, want);
-    }
+    let y = broadcast_in_dim_like(x, &out_shape, &dims)?;
 
     env.insert(op.result_name.clone(), y);
     Ok(())
@@ -544,6 +672,17 @@ fn lower_slice(
         _ => bail!("slice: unsupported number of dimensions"),
     };
 
+    env.insert(op.result_name.clone(), y);
+    Ok(())
+}
+fn lower_unary_not(
+    op: &Operation,
+    g: &mut Graph,
+    env: &mut HashMap<String, GraphTensor>,
+) -> Result<()> {
+    let x = env[&op.operands[0]];
+    let zero_tensor = g.constant(0.0).expand(x.shape).retrieve();
+    let y = x.eq(zero_tensor);
     env.insert(op.result_name.clone(), y);
     Ok(())
 }

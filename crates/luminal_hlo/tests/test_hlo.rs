@@ -123,6 +123,18 @@ fn test_stablehlo_compare_op() {
 }
 
 #[test]
+fn test_stablehlo_logical_op() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_logical_op.mlir");
+
+    inputs["%arg0"].set([0., 1., 0., 1., 0.]);
+
+    cx.execute();
+
+    let expected = [1., 0., 1., 0., 1.];
+    assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
 fn test_stablehlo_dot_general_op() {
     let (mut cx, inputs) = import_hlo("tests/data/stablehlo_dot_general_op.mlir");
 
@@ -132,5 +144,18 @@ fn test_stablehlo_dot_general_op() {
     cx.execute();
 
     let expected = [58., 64., 139., 154.];
+    assert_close(&inputs["%0"].data(), &expected);
+}
+
+#[test]
+fn test_stablehlo_dot_general_op_batching() {
+    let (mut cx, inputs) = import_hlo("tests/data/stablehlo_dot_general_op_batching.mlir");
+
+    inputs["%arg0"].set([1., 2., 3., 4., 5., 6., 7., 8., 9., 1., 0., 1.]);
+    inputs["%arg1"].set([1., 0., 0., 1., 1., 1., 1., 2., 3., 4., 5., 6.]);
+
+    cx.execute();
+
+    let expected = [4., 5., 10., 11., 76., 100., 6., 8.];
     assert_close(&inputs["%0"].data(), &expected);
 }
